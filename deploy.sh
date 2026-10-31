@@ -6,43 +6,53 @@
 #   sudo bash deploy-vps.sh              # hoặc chạy file đã có trên máy: cài mới; đã cài thì hỏi cập nhật / đổi cách truy cập
 #   sudo ads-agent-deploy update         # kéo mã mới nhất + build lại + khởi động lại (dữ liệu giữ nguyên)
 #   sudo ads-agent-deploy reconfigure    # đổi cách đưa web ra Internet (Tunnel / trỏ IP / proxy Cloudflare)
+#   sudo ads-agent-deploy token          # đổi username / token GitHub (token hết hạn, đổi tài khoản)
 #   sudo ads-agent-deploy setup-key      # in lại mã thiết lập (SETUP_TOKEN) để tạo quản trị viên đầu tiên
 # Sau lần cài đầu, script được chép thành lệnh `sudo ads-agent-deploy <lệnh>`.
 #
 # Các bước: bảng kiểm tra máy (root, OS, RAM/ổ đĩa, mạng GitHub/Docker Hub, Docker, cổng 80/443, đồng hồ, tường lửa,
-# Ads MCP) → hỏi tên miền + cách truy cập + cách lấy mã nguồn → cài Docker → quyền đọc repo: Deploy key (in ra để
-# dán vào GitHub → Settings → Deploy keys, rồi gõ Y + Enter) HOẶC username + token classic (quyền repo) → tải mã
-# nguồn → tạo .env (secret ngẫu nhiên) → chứng chỉ / token theo cách truy cập → build 3 image → chạy → kiểm tra sức
-# khoẻ → in địa chỉ /setup và mã thiết lập. Bản công khai deploy.sh ở repo notivn/ads-agent-simple-install là bản
-# chép NGUYÊN file này (nguồn duy nhất: scripts/deploy-vps.sh của repo chính).
+# Ads MCP) → hỏi tên miền + cách truy cập → cài Docker → username + token classic GitHub (quyền repo, gõ ẩn, kiểm
+# bằng API) → tải mã nguồn → tạo .env (secret ngẫu nhiên + username/token/nguồn cập nhật) → chứng chỉ / token theo
+# cách truy cập → build 4 image (app, gateway, updater) → chạy → kiểm tra sức khoẻ → in địa chỉ /setup và mã thiết
+# lập. Bản công khai deploy.sh ở repo notivn/ads-agent-simple-install là bản chép NGUYÊN file này (nguồn duy nhất:
+# scripts/deploy-vps.sh của repo chính).
+# Cập nhật bằng nút trên web (.claude/docs/14-update-system.md §9): .env có UPDATE_GITHUB_USER, UPDATE_GITHUB_TOKEN,
+# UPDATE_REPO, UPDATE_SOURCE=branch, UPDATE_BRANCH và COMPOSE_PROFILES=updater. Bản mới = "version" trong package.json
+# ở đầu nhánh (tăng version + push là phát hành cho mọi VPS). Worker dùng token để kiểm tra bản mới, updater dùng nó
+# để git fetch rồi build image ngay trên VPS; container web không bao giờ nhận token.
 # 3 cách truy cập Internet (.claude/docs/13-deployment.md §3):
 #   1 Cloudflare Tunnel  - không mở cổng, dán token tunnel (dùng được cả khi VPS đang chạy Ads MCP Simple)
 #   2 Trỏ IP về VPS      - bản ghi A → IP VPS, hệ thống tự xin chứng chỉ SSL Let's Encrypt (cần cổng 80/443 trống)
 #   3 Proxy Cloudflare   - bản ghi A mây cam, dán Origin Certificate + Private key của Cloudflare (SSL Full strict)
 # Bí mật (token GitHub, token tunnel, khoá riêng Origin, nội dung .env) không bao giờ in ra màn hình, ghi log hay
-# nằm trong tham số lệnh / URL / .git/config. Log: /var/log/ads-agent-deploy.log.
+# nằm trong tham số lệnh / URL / .git/config. Token GitHub chỉ nằm trong .env (quyền 600, chỉ root đọc được), đi tới
+# git qua GIT_ASKPASS (biến môi trường) và tới curl qua header đọc từ file 600. Log: /var/log/ads-agent-deploy.log.
 # Không đụng tới Ads MCP Simple: thư mục, mạng, volume, Caddyfile, docker login của nó đều giữ nguyên.
-# Ghi chú: image tự build không có chữ ký số phát hành nên tính năng "Cập nhật 1 nút" trên web (updater) được tắt;
-# cập nhật bằng `sudo ads-agent-deploy update`. Khi đã có bản phát hành chính thức trên GHCR, dùng
-# scripts/install-ads-agent.sh để chuyển sang chế độ kéo image + cập nhật 1 nút.
+# Bản cài cũ (Deploy key, hoặc token ở /etc/ads-agent/git-auth): `update` / `reconfigure` tự chuyển sang token trong
+# .env + remote HTTPS, rồi gỡ Deploy key cũ trên máy.
 
 set -Eeuo pipefail
 
-REPO="${ADS_AGENT_REPO:-notivn/Ads-Agent-Simple}"
-BRANCH="${ADS_AGENT_BRANCH:-main}"
+REPO="${ADS_AGENT_REPO:-}"
+BRANCH="${ADS_AGENT_BRANCH:-}"
+DEFAULT_REPO="notivn/Ads-Agent-Simple"
+DEFAULT_BRANCH="main"
 DIR="${ADS_AGENT_DIR:-/opt/ads-agent}"
-KEY="/root/.ssh/ads_agent_deploy_ed25519"
-KNOWN_HOSTS="/root/.ssh/known_hosts_ads_agent"
-# Fingerprint khoá máy chủ ed25519 của github.com (GitHub công bố tại docs.github.com: "GitHub's SSH key fingerprints")
-GITHUB_ED25519_FP="SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
 LOG="/var/log/ads-agent-deploy.log"
 CONF="/etc/ads-agent.conf"
 SELF_BIN="/usr/local/bin/ads-agent-deploy"
 HELPER_BIN="/usr/local/bin/ads-agent"
+# thư mục docker login riêng mà service updater mount (chỉ đọc); bản build từ mã nguồn không cần đăng nhập GHCR
+UPDATER_DOCKER_DIR="/root/.docker-ads-agent"
+# dấu vết của các bản cài cũ (chỉ để chuyển đổi rồi gỡ): Deploy key SSH và file token riêng
+LEGACY_KEY="/root/.ssh/ads_agent_deploy_ed25519"
+LEGACY_KNOWN_HOSTS="/root/.ssh/known_hosts_ads_agent"
+LEGACY_GIT_CRED_DIR="/etc/ads-agent"
+LEGACY_GIT_CRED="$LEGACY_GIT_CRED_DIR/git-auth"
 MIN_MEM_MB=4096 # RAM + swap tối thiểu để build image Next.js trên VPS
 
 DOMAIN="" EMAIL="" ACCESS="" GATEWAYS=1 TUNNEL_TOKEN_VALUE="" CERT_PEM="" KEY_PEM="" PUBLIC_IP=""
-PORTS_BUSY=0 PORTS_BUSY_BY="" OS_ID="" TMPD="" GH_SSH_HOST=github.com GH_SSH_PORT=22
+PORTS_BUSY=0 PORTS_BUSY_BY="" OS_ID="" TMPD="" TG_BLOCKED=0 TG_PROXY="" TG_PROXY_SET=0
 
 # ------------------------------------------------------------------------------------------------------------------
 # Giao diện
@@ -69,7 +79,13 @@ step() {
   printf '\n%s[%s/%s] %s%s\n' "$C_BLU$C_BLD" "$STEP_N" "$STEP_TOTAL" "$*" "$C_RST"
   log "== [$STEP_N/$STEP_TOTAL] $*"
 }
-cleanup() { [[ -n "$TMPD" && -d "$TMPD" ]] && rm -rf "$TMPD"; return 0; }
+UPDATER_STOPPED=0
+cleanup() {
+  [[ -n "$TMPD" && -d "$TMPD" ]] && rm -rf "$TMPD"
+  # cmd_update tạm dừng updater: bật lại kể cả khi dừng giữa chừng
+  if [[ $UPDATER_STOPPED -eq 1 ]]; then (cd "$DIR" && docker compose start updater) >/dev/null 2>&1 || true; fi
+  return 0
+}
 trap cleanup EXIT
 trap 'die "Lỗi không mong muốn ở dòng $LINENO (lệnh: ${BASH_COMMAND%% *})."' ERR
 
@@ -165,15 +181,16 @@ run_logged() { # run_logged "mô tả" lệnh... : chạy, ghi log; lỗi thì i
   fi
 }
 
-# Git qua SSH bằng Deploy key riêng của Ads Agent (không sửa ~/.ssh/config, không dùng khoá khác của máy)
-GIT_SSH="ssh -i $KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o BatchMode=yes"
-git_ssh() { GIT_SSH_COMMAND="$GIT_SSH" GIT_TERMINAL_PROMPT=0 git "$@"; }
-repo_ssh_url() {
-  if [[ "$GH_SSH_PORT" == "22" ]]; then
-    printf 'git@github.com:%s.git' "$REPO"
-  else
-    printf 'ssh://git@%s:%s/%s.git' "$GH_SSH_HOST" "$GH_SSH_PORT" "$REPO"
-  fi
+# repo / nhánh: biến môi trường ADS_AGENT_REPO / ADS_AGENT_BRANCH > UPDATE_REPO / UPDATE_BRANCH của .env > mặc định
+resolve_source() {
+  [[ -n "$REPO" ]] || REPO=$(env_get UPDATE_REPO)
+  [[ -n "$REPO" ]] || REPO=$DEFAULT_REPO
+  [[ -n "$BRANCH" ]] || BRANCH=$(env_get UPDATE_BRANCH)
+  [[ -n "$BRANCH" ]] || BRANCH=$DEFAULT_BRANCH
+  [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || die "Tên repo không hợp lệ: $REPO (cần dạng tên-chủ/tên-repo)."
+  [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]{1,100}$ && "$BRANCH" != -* && "$BRANCH" != *..* && "$BRANCH" != *.lock &&
+    "$BRANCH" != *. && "$BRANCH" != /* && "$BRANCH" != */ && "$BRANCH" != *//* && "$BRANCH" != .* &&
+    "$BRANCH" != */.* ]] || die "Tên nhánh không hợp lệ: $BRANCH."
 }
 
 dc_build() { (cd "$DIR" && docker compose -f docker-compose.yml -f docker-compose.build.yml "$@"); }
@@ -200,7 +217,7 @@ precheck() {
   step "Kiểm tra máy chủ trước khi cài"
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Cần quyền root. Chạy lại với sudo (hoặc đăng nhập root)."
   tty_ok || die "Script cần bàn phím để hỏi thông tin. Hãy chạy trực tiếp trong terminal SSH."
-  : >>"$LOG" 2>/dev/null && chmod 600 "$LOG" 2>/dev/null || LOG=/dev/null
+  [[ ! -L "$LOG" ]] && : >>"$LOG" 2>/dev/null && chmod 600 "$LOG" 2>/dev/null || LOG=/dev/null
   pf_ok "Quyền root"
 
   # --- hệ điều hành, kiến trúc
@@ -244,35 +261,28 @@ precheck() {
   if getent ahosts github.com >/dev/null 2>&1; then pf_ok "DNS của VPS phân giải được tên miền"; else
     pf_fail "VPS không phân giải được github.com. Kiểm tra /etc/resolv.conf (thử nameserver 1.1.1.1)."
   fi
-  GH_SSH_OK=1 GH_HTTPS_OK=1
-  if tcp_ok github.com 22; then
-    GH_SSH_HOST=github.com GH_SSH_PORT=22
-    pf_ok "Kết nối GitHub qua SSH (github.com:22) - dùng được Deploy key"
-  elif tcp_ok ssh.github.com 443; then
-    GH_SSH_HOST=ssh.github.com GH_SSH_PORT=443
-    pf_ok "Cổng 22 ra ngoài bị chặn → Deploy key đi qua ssh.github.com:443"
+  # mã nguồn + kiểm tra / cập nhật bản mới chỉ đi qua HTTPS (username + token classic), không cần SSH
+  if tcp_ok github.com 443 && tcp_ok api.github.com 443; then
+    pf_ok "Kết nối GitHub qua HTTPS (github.com, api.github.com cổng 443)"
   else
-    GH_SSH_OK=0
-  fi
-  tcp_ok github.com 443 && tcp_ok api.github.com 443 || GH_HTTPS_OK=0
-  if [[ $GH_HTTPS_OK -eq 1 ]]; then pf_ok "Kết nối GitHub qua HTTPS (github.com:443) - dùng được token"; fi
-  if [[ $GH_SSH_OK -eq 0 && $GH_HTTPS_OK -eq 0 ]]; then
-    pf_fail "Không kết nối được GitHub (cả SSH lẫn HTTPS). Mở kết nối ra ngoài ở tường lửa VPS."
-  elif [[ $GH_SSH_OK -eq 0 ]]; then
-    pf_warn "Không vào được GitHub qua SSH → chỉ dùng được cách lấy mã bằng username + token."
+    pf_fail "Không kết nối được GitHub qua HTTPS (github.com / api.github.com cổng 443). Mở kết nối ra ngoài ở tường lửa VPS."
   fi
   if tcp_ok registry-1.docker.io 443; then pf_ok "Kết nối Docker Hub (tải image cơ sở)"; else
     pf_fail "Không kết nối được Docker Hub (registry-1.docker.io:443): không tải được image PostgreSQL/Caddy."
   fi
+  if telegram_reachable; then pf_ok "Kết nối Telegram (api.telegram.org)"; else
+    TG_BLOCKED=1
+    pf_warn "Không gọi được api.telegram.org (nhà mạng có thể chặn Telegram) — bot sẽ nhận tin nhưng không trả lời được. Cần proxy: xem docs/huong-dan-telegram.md"
+  fi
 
-  # --- đồng hồ (xác thực 2 bước TOTP và chứng chỉ SSL cần giờ đúng)
+  # --- đồng hồ (mã xác thực 2 bước - nếu bật - và chứng chỉ SSL cần giờ đúng)
   local ntp
   ntp=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)
   if [[ "$ntp" == "yes" ]]; then
     pf_ok "Đồng hồ hệ thống đã đồng bộ (NTP)"
   else
     timedatectl set-ntp true >/dev/null 2>&1 || true
-    pf_warn "Đồng hồ chưa đồng bộ NTP (đã bật tự đồng bộ). Giờ lệch làm mã 2FA và SSL báo lỗi."
+    pf_warn "Đồng hồ chưa đồng bộ NTP (đã bật tự đồng bộ). Giờ lệch làm SSL (và mã xác thực 2 bước, nếu bật) báo lỗi."
   fi
 
   # --- Docker
@@ -398,6 +408,62 @@ ask_access() {
   done
 }
 
+# Telegram Bot API ra ngoài: curl (nếu có) để thấy cả trường hợp nhà mạng cắt TLS; chưa có curl thì kiểm TCP
+telegram_reachable() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -sS -m 8 -o /dev/null https://api.telegram.org 2>/dev/null
+  else
+    tcp_ok api.telegram.org 443
+  fi
+}
+
+# TELEGRAM_API_BASE_URL hợp lệ: cùng luật với isSafeTelegramBaseUrl (src/server/env.ts) - https, không user/mật khẩu,
+# không ?query, không #
+valid_tg_proxy() {
+  [[ "$1" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(/[A-Za-z0-9._~%/-]*)?$ ]]
+}
+
+# Hỏi proxy Telegram (Cloudflare Worker chuyển tiếp /bot<token>/…). -> TG_PROXY, TG_PROXY_SET=1 khi cần ghi .env
+ask_telegram_proxy() {
+  local cur url
+  cur=$(env_get TELEGRAM_API_BASE_URL)
+  TG_PROXY_SET=0
+  say ""
+  info "Telegram: máy chủ không gọi được api.telegram.org. Dùng proxy (vd Cloudflare Worker) để bot trả lời được — cách tạo: docs/huong-dan-telegram.md."
+  [[ -z "$cur" ]] || info "Đang dùng: $cur (Enter để giữ, gõ - để bỏ proxy)."
+  while :; do
+    ask "Địa chỉ proxy Telegram (TELEGRAM_API_BASE_URL, vd https://tg-proxy.ten.workers.dev) — Enter để bỏ qua" "$cur"
+    url=$(printf '%s' "$REPLY" | tr -d '[:space:]')
+    url=${url%/}
+    if [[ -z "$url" || "$url" == "-" ]]; then
+      TG_PROXY=""
+      [[ -z "$cur" ]] || TG_PROXY_SET=1
+      warn "Không dùng proxy Telegram: bot nhận tin nhưng không trả lời được cho tới khi đặt TELEGRAM_API_BASE_URL (sudo ads-agent-deploy reconfigure)."
+      return 0
+    fi
+    if ! valid_tg_proxy "$url"; then
+      warn "Địa chỉ phải dạng https://tên-miền[/đường-dẫn], không kèm user/mật khẩu, ?query hay #."
+      continue
+    fi
+    # Worker chuyển tiếp trả 404 cho "/" là đúng: chỉ cần có phản hồi HTTP
+    if command -v curl >/dev/null 2>&1 && ! curl -sS -m 8 -o /dev/null "$url/" 2>/dev/null; then
+      warn "Không kết nối được tới $url (sai địa chỉ Worker, hoặc Worker chưa chạy)."
+      ask_yn "Vẫn dùng địa chỉ này?" N || continue
+    fi
+    TG_PROXY=$url
+    TG_PROXY_SET=1
+    ok "Proxy Telegram: $url"
+    return 0
+  done
+}
+
+apply_telegram_env() {
+  [[ $TG_PROXY_SET -eq 1 ]] || return 0
+  env_set TELEGRAM_API_BASE_URL "$TG_PROXY"
+  chmod 600 "$DIR/.env"
+  if [[ -n "$TG_PROXY" ]]; then ok "Đã ghi TELEGRAM_API_BASE_URL vào .env"; else ok "Đã bỏ TELEGRAM_API_BASE_URL trong .env"; fi
+}
+
 ask_gateways() {
   say ""
   info "Gateway ChatGPT / Gemini cho phép agent dùng tài khoản ChatGPT / Gemini (web) thay cho API key (tốn thêm ~250 MB RAM)."
@@ -412,7 +478,7 @@ apt_install() { DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60
 
 install_base() {
   local need=() p
-  for p in git curl ca-certificates openssh-client openssl; do
+  for p in git curl ca-certificates openssl; do
     dpkg -s "$p" >/dev/null 2>&1 || need+=("$p")
   done
   if [[ ${#need[@]} -gt 0 ]]; then
@@ -420,7 +486,7 @@ install_base() {
     run_logged "apt-get update" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update -q || die "apt-get update lỗi."
     run_logged "apt-get install base" apt_install "${need[@]}" || die "Không cài được: ${need[*]}."
   fi
-  ok "Đã có git, curl, ssh, openssl"
+  ok "Đã có git, curl, openssl"
 }
 
 install_docker() {
@@ -460,6 +526,7 @@ Components: stable
 Architectures: $(dpkg --print-architecture)
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
+  chmod 644 /etc/apt/sources.list.d/docker.sources
   run_logged "apt-get update (docker)" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update -q || die "apt-get update lỗi."
   run_logged "apt-get install docker" apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin ||
     die "Cài Docker thất bại."
@@ -469,46 +536,22 @@ EOF
 }
 
 # ------------------------------------------------------------------------------------------------------------------
-# Deploy key + mã nguồn
+# Username + token classic GitHub + mã nguồn
 # ------------------------------------------------------------------------------------------------------------------
-# GitHub SSH: github.com:22, hoặc ssh.github.com:443 khi VPS chặn cổng 22 ra ngoài (cùng khoá máy chủ)
-detect_github_ssh() {
-  if tcp_ok github.com 22; then
-    GH_SSH_HOST=github.com GH_SSH_PORT=22
-  elif tcp_ok ssh.github.com 443; then
-    GH_SSH_HOST=ssh.github.com GH_SSH_PORT=443
-  fi
-}
-
-pin_github_host_key() {
-  local scan fp spec=$GH_SSH_HOST
-  [[ "$GH_SSH_PORT" == "22" ]] || spec="[$GH_SSH_HOST]:$GH_SSH_PORT"
-  install -d -m 700 /root/.ssh
-  if [[ -s "$KNOWN_HOSTS" ]]; then
-    fp=$(ssh-keygen -F "$spec" -f "$KNOWN_HOSTS" 2>/dev/null | grep -v '^#' | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | head -n 1 || true)
-    [[ "$fp" == "$GITHUB_ED25519_FP" ]] && return 0
-  fi
-  scan=$(ssh-keyscan -p "$GH_SSH_PORT" -t ed25519 "$GH_SSH_HOST" 2>/dev/null | grep -v '^#' || true)
-  [[ -n "$scan" ]] || die "Không kết nối được $GH_SSH_HOST:$GH_SSH_PORT (tường lửa chặn kết nối ra ngoài?)."
-  fp=$(printf '%s\n' "$scan" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | head -n 1 || true)
-  [[ "$fp" == "$GITHUB_ED25519_FP" ]] ||
-    die "Khoá máy chủ GitHub không khớp fingerprint GitHub công bố ($fp). Có thể mạng bị can thiệp - dừng lại."
-  printf '%s\n' "$scan" >>"$KNOWN_HOSTS"
-  chmod 600 "$KNOWN_HOSTS"
-}
-
-# ---- 2 cách lấy mã nguồn: GIT_AUTH = key (Deploy key, SSH) | token (username + token classic, HTTPS)
 # Token: chỉ đi qua biến môi trường của tiến trình git (GIT_ASKPASS) và header curl đọc từ file 600 - không bao giờ
-# nằm trong URL, argv, .git/config, log hay màn hình. Lưu ở GIT_CRED (root, 600) để `update` dùng lại.
-GIT_AUTH="" GH_USER="" GH_TOKEN=""
-GIT_CRED_DIR="/etc/ads-agent"
-GIT_CRED="$GIT_CRED_DIR/git-auth"
+# nằm trong URL, argv, .git/config, log hay màn hình. Lưu trong $DIR/.env (UPDATE_GITHUB_USER / UPDATE_GITHUB_TOKEN,
+# quyền 600) để `update` và nút cập nhật trên web dùng lại (worker kiểm tra bản mới, updater tải mã + build).
+GH_USER="" GH_TOKEN=""
 
 askpass_helper() {
   local h="$TMPD/askpass.sh"
   if [[ ! -x "$h" ]]; then
     cat >"$h" <<'EOF'
 #!/bin/sh
+case "$1" in
+  *"'https://github.com'"* | *"@github.com'"*) ;;
+  *) exit 1 ;;
+esac
 case "$1" in
   Username*) printf '%s\n' "$ADS_AGENT_GIT_USER" ;;
   *) printf '%s\n' "$ADS_AGENT_GIT_TOKEN" ;;
@@ -518,53 +561,69 @@ EOF
   fi
   printf '%s' "$h"
 }
-git_https() {
+# Mọi lệnh git của script: không đọc cấu hình hệ thống / global, không hook / fsmonitor / credential helper / ssh,
+# không theo redirect (token chỉ tới github.com), luôn kiểm TLS, bỏ proxy trong cấu hình git, không submodule.
+# Chạy với umask 022 (main đặt umask 077): file mã nguồn phải đọc được khi build image (user không phải root).
+GIT_SAFE_OPTS=(-c credential.helper= -c core.sshCommand= -c core.hooksPath=/dev/null -c core.fsmonitor=false
+  -c http.followRedirects=false -c http.sslVerify=true -c http.proxy= -c submodule.recurse=false
+  -c fetch.recurseSubmodules=false)
+git_safe() (
+  umask 022
+  GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git "${GIT_SAFE_OPTS[@]}" "$@"
+)
+# git_safe + username / token qua GIT_ASKPASS (chỉ lệnh nói chuyện với GitHub)
+git_https() (
+  umask 022
   ADS_AGENT_GIT_USER="$GH_USER" ADS_AGENT_GIT_TOKEN="$GH_TOKEN" GIT_ASKPASS="$(askpass_helper)" \
-    GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c core.sshCommand= "$@"
-}
-git_remote() { if [[ "$GIT_AUTH" == "token" ]]; then git_https "$@"; else git_ssh "$@"; fi; }
-repo_url() {
-  if [[ "$GIT_AUTH" == "token" ]]; then printf 'https://github.com/%s.git' "$REPO"; else repo_ssh_url; fi
-}
-repo_reachable() { git_remote ls-remote --heads "$(repo_url)" "$BRANCH" >/dev/null 2>&1; }
+    GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git "${GIT_SAFE_OPTS[@]}" "$@"
+)
 
-ask_git_auth() {
-  say ""
-  say "   ${C_BLD}Cách lấy mã nguồn từ repo GitHub riêng tư $REPO:${C_RST}"
-  say "     1) Deploy key (khuyến nghị) — script tạo khoá chỉ quyền ĐỌC, bạn dán vào repo → Settings → Deploy keys"
-  say "     2) Username + token classic GitHub — token (PAT classic) có quyền repo của tài khoản được vào repo"
-  local def=1
-  if [[ ${GH_SSH_OK:-1} -eq 0 ]]; then
-    def=2
-    warn "VPS không vào được GitHub qua SSH nên chỉ dùng được cách 2."
-  fi
-  while :; do
-    ask "Chọn 1 hoặc 2" "$def"
-    case "$REPLY" in
-      1)
-        [[ ${GH_SSH_OK:-1} -eq 1 ]] || { warn "Cách 1 cần SSH tới GitHub (đang bị chặn). Chọn 2."; continue; }
-        GIT_AUTH=key
-        ;;
-      2) GIT_AUTH=token ;;
-      *)
-        warn "Chỉ nhập 1 hoặc 2."
-        continue
-        ;;
-    esac
-    break
+# .git/config của chính thư mục cài đặt không được có mục chạy mã / đổi URL / lộ credential (cùng luật với updater:
+# scripts/updater-core.ts UNSAFE_LOCAL_GIT_CONFIG_RE; git trả tên khoá chữ thường)
+UNSAFE_GIT_CONFIG_RE='^(url\.|http\.|include|core\.(fsmonitor|hookspath|sshcommand|askpass)|credential|filter\.)'
+check_local_git_config() {
+  local keys
+  keys=$(git_safe -C "$DIR" config --local --get-regexp "$UNSAFE_GIT_CONFIG_RE" 2>/dev/null | awk '{print $1}' | tr '\n' ' ' || true)
+  [[ -z "${keys// /}" ]] ||
+    die "Cấu hình git của $DIR có mục không an toàn: ${keys% }. Kiểm tra rồi xoá: cd $DIR && git config --local --unset <tên>"
+}
+
+# File riêng của máy chủ mà git không được ghi / xoá (cùng luật với scripts/updater-core.ts sensitiveTrackedPaths):
+# .env* (trừ .env.example), *.key, *.pem, *.dump, backups/, deploy/caddy/certs/. Đọc danh sách NUL từ stdin.
+sensitive_paths() {
+  local p base lower
+  while IFS= read -r -d '' p; do
+    base=${p##*/}
+    lower=${base,,}
+    [[ "$base" == .env.example ]] && continue
+    if [[ "$base" == .env || "$base" == .env.* || "$lower" == *.key || "$lower" == *.pem || "$lower" == *.dump ||
+      "$p" == backups || "$p" == backups/* || "$p" == deploy/caddy/certs || "$p" == deploy/caddy/certs/* ]]; then
+      printf '%s\n' "$p"
+    fi
   done
 }
+repo_url() { printf 'https://github.com/%s.git' "$REPO"; }
+repo_reachable() { git_https ls-remote --heads "$(repo_url)" "$BRANCH" >/dev/null 2>&1; }
 
-# token_check: 0 = token đọc được repo. Ghi lý do vào TOKEN_PROBLEM.
-TOKEN_PROBLEM=""
-token_check() {
-  local hdr="$TMPD/gh.hdr" out="$TMPD/gh.out" code scopes
+# gh_api PATH -> mã HTTP; nội dung trả về ở $TMPD/gh.out, header ở $TMPD/gh.head. Token đọc từ file header 600.
+gh_api() {
+  local hdr="$TMPD/gh.hdr" code
   (
     umask 077
-    printf 'Authorization: token %s\nAccept: application/vnd.github+json\nUser-Agent: ads-agent-deploy\n' "$GH_TOKEN" >"$hdr"
+    printf 'Authorization: token %s\nAccept: application/vnd.github+json\nUser-Agent: ads-agent-deploy\nX-GitHub-Api-Version: 2022-11-28\n' "$GH_TOKEN" >"$hdr"
   )
-  code=$(curl -sS -o "$out" -D "$TMPD/gh.head" -w '%{http_code}' --max-time 15 -H @"$hdr" "https://api.github.com/repos/$REPO" 2>/dev/null || true)
+  code=$(curl -sS -o "$TMPD/gh.out" -D "$TMPD/gh.head" -w '%{http_code}' --max-time 15 -H @"$hdr" "https://api.github.com$1" 2>/dev/null || true)
   rm -f "$hdr"
+  printf '%s' "$code"
+}
+
+# token_check: 0 = token đọc được repo. Ghi lý do vào TOKEN_PROBLEM; TOKEN_CAN_WRITE=1 khi token có quyền GHI repo.
+TOKEN_PROBLEM="" TOKEN_CAN_WRITE=0
+token_check() {
+  local code scopes perms login
+  TOKEN_PROBLEM="" TOKEN_CAN_WRITE=0
+  [[ -n "$GH_TOKEN" ]] || { TOKEN_PROBLEM="chưa có token"; return 1; }
+  code=$(gh_api "/repos/$REPO")
   scopes=$(sed -n 's/^[Xx]-[Oo][Aa]uth-[Ss]copes: *//p' "$TMPD/gh.head" 2>/dev/null | tr -d '\r' || true)
   case "$code" in
     200)
@@ -572,38 +631,53 @@ token_check() {
         TOKEN_PROBLEM="token thiếu quyền repo (đang có: $scopes)"
         return 1
       fi
+      perms=$(tr -d ' \r\n\t' <"$TMPD/gh.out" 2>/dev/null | grep -o '"permissions":{[^}]*}' | head -n 1 || true)
+      if [[ "$perms" == *'"push":true'* || "$perms" == *'"admin":true'* ]]; then TOKEN_CAN_WRITE=1; fi
+      # username thật của token (GitHub bỏ qua username khi xác thực bằng token, nhưng .env nên ghi đúng)
+      if [[ "$(gh_api /user)" == "200" ]]; then
+        login=$(tr -d ' \r\n\t' <"$TMPD/gh.out" | sed -n 's/.*"login":"\([A-Za-z0-9-]*\)".*/\1/p' | head -n 1 || true)
+        if [[ -n "$login" && "${login,,}" != "${GH_USER,,}" ]]; then
+          info "Token thuộc tài khoản $login (bạn nhập ${GH_USER:-<trống>}): dùng $login."
+          GH_USER=$login
+        fi
+      fi
+      rm -f "$TMPD/gh.out" "$TMPD/gh.head"
       return 0
       ;;
     401) TOKEN_PROBLEM="token sai, đã bị thu hồi hoặc hết hạn (GitHub trả 401)" ;;
     403) TOKEN_PROBLEM="token bị từ chối (403): thiếu quyền repo, hoặc tổ chức chặn token classic (SSO chưa authorize)" ;;
-    404) TOKEN_PROBLEM="tài khoản $GH_USER không thấy repo $REPO (404): chưa được mời vào repo hoặc token thiếu quyền repo" ;;
+    404) TOKEN_PROBLEM="tài khoản ${GH_USER:-của token} không thấy repo $REPO (404): chưa được mời vào repo hoặc token thiếu quyền repo" ;;
     *) TOKEN_PROBLEM="không gọi được GitHub API (mã ${code:-?}), kiểm tra mạng" ;;
   esac
+  rm -f "$TMPD/gh.out" "$TMPD/gh.head"
   return 1
 }
 
-load_token() {
-  GH_USER=$(env_get GIT_USER "$GIT_CRED")
-  GH_TOKEN=$(env_get GIT_TOKEN "$GIT_CRED")
-}
-save_token() {
-  install -d -m 700 "$GIT_CRED_DIR"
-  [[ -f "$GIT_CRED" ]] || (umask 077 && : >"$GIT_CRED")
-  env_set GIT_USER "$GH_USER" "$GIT_CRED"
-  env_set GIT_TOKEN "$GH_TOKEN" "$GIT_CRED"
-  chmod 600 "$GIT_CRED"
+token_write_warning() {
+  [[ $TOKEN_CAN_WRITE -eq 1 ]] || return 0
+  warn "Token của $GH_USER có quyền GHI vào repo $REPO (push/admin). Token nằm trên VPS nên khuyến nghị:"
+  info "dùng một tài khoản GitHub riêng chỉ được mời quyền Read vào repo, tạo token classic (quyền repo) từ tài khoản đó,"
+  info "rồi đổi bằng: sudo ads-agent-deploy token. (Chỉ là khuyến nghị, cài đặt vẫn tiếp tục.)"
 }
 
-setup_token() {
+# Ghi username/token + nguồn cập nhật vào .env (quyền 600): worker kiểm tra bản mới, updater tải mã + build.
+save_token_env() {
+  [[ -f "$DIR/.env" ]] || return 0
+  env_set UPDATE_GITHUB_USER "$GH_USER"
+  env_set UPDATE_GITHUB_TOKEN "$GH_TOKEN"
+  env_set UPDATE_REPO "$REPO"
+  env_set UPDATE_SOURCE branch
+  env_set UPDATE_BRANCH "$BRANCH"
+  chmod 600 "$DIR/.env"
+}
+
+# Hỏi username + token đến khi dùng được (đọc được repo bằng API và bằng git). Không lưu: người gọi lưu.
+ask_token() {
   say ""
-  say "   ${C_BLD}Tạo token classic (nếu chưa có):${C_RST}"
+  say "   ${C_BLD}Username + token classic GitHub (để tải mã nguồn và cập nhật bản mới từ trang chủ):${C_RST}"
   say "     GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic) → Generate new token"
-  say "     Tick quyền ${C_BLD}repo${C_RST} → Generate → copy token (bắt đầu bằng ghp_). Tài khoản phải được vào repo $REPO."
-  load_token
-  if [[ -n "$GH_TOKEN" ]] && token_check && ask_yn "Đã có token đang hoạt động cho tài khoản $GH_USER. Dùng lại?" Y; then
-    ok "Dùng token đã lưu của $GH_USER"
-    return 0
-  fi
+  say "     Tick quyền ${C_BLD}repo${C_RST} → Generate → copy token (bắt đầu bằng ghp_). Tài khoản phải được mời vào repo $REPO."
+  info "Khuyến nghị: tài khoản GitHub riêng cho máy chủ, chỉ được mời quyền Read vào repo."
   while :; do
     ask "Username GitHub" "$GH_USER"
     GH_USER=$(printf '%s' "$REPLY" | tr -d '[:space:]')
@@ -612,81 +686,100 @@ setup_token() {
     GH_TOKEN=$(printf '%s' "$REPLY" | tr -d '[:space:]')
     REPLY=""
     [[ -n "$GH_TOKEN" ]] || { warn "Chưa nhập token."; continue; }
+    [[ "$GH_TOKEN" =~ ^[A-Za-z0-9_]+$ ]] || { warn "Token chỉ gồm chữ, số và dấu gạch dưới (ghp_…). Dán lại."; continue; }
     if token_check && repo_reachable; then
-      save_token
-      ok "Token hoạt động: tài khoản $GH_USER đọc được repo $REPO (lưu ở $GIT_CRED, chỉ root đọc được)"
+      ok "Token hoạt động: tài khoản $GH_USER đọc được repo $REPO (nhánh $BRANCH)"
+      token_write_warning
       return 0
     fi
-    warn "Không dùng được token: ${TOKEN_PROBLEM:-git không đọc được repo}. Nhập lại."
+    warn "Không dùng được token: ${TOKEN_PROBLEM:-git không đọc được repo hoặc nhánh $BRANCH}. Nhập lại."
   done
 }
 
-setup_source_auth() {
-  if [[ "$GIT_AUTH" == "token" ]]; then setup_token; else setup_deploy_key; fi
+# Token đã lưu: .env (bản cài mới) hoặc /etc/ads-agent/git-auth (bản cài cũ) -> GH_USER / GH_TOKEN
+load_token() {
+  GH_USER=$(env_get UPDATE_GITHUB_USER)
+  GH_TOKEN=$(env_get UPDATE_GITHUB_TOKEN)
+  if [[ -z "$GH_TOKEN" && -f "$LEGACY_GIT_CRED" ]]; then
+    GH_USER=$(env_get GIT_USER "$LEGACY_GIT_CRED")
+    GH_TOKEN=$(env_get GIT_TOKEN "$LEGACY_GIT_CRED")
+    [[ -z "$GH_TOKEN" ]] || info "Bản cài cũ: chuyển token GitHub từ $LEGACY_GIT_CRED sang $DIR/.env"
+  fi
 }
 
-setup_deploy_key() {
-  pin_github_host_key
-  if [[ ! -f "$KEY" ]]; then
-    ssh-keygen -q -t ed25519 -N "" -C "ads-agent-deploy@$(hostname -s 2>/dev/null || echo vps)" -f "$KEY"
-    chmod 600 "$KEY"
+# Bản cài cũ: gỡ file token riêng, Deploy key + known_hosts riêng của Ads Agent, core.sshCommand trong repo.
+cleanup_legacy_auth() {
+  local removed=0
+  if [[ -f "$LEGACY_GIT_CRED" ]]; then
+    rm -f "$LEGACY_GIT_CRED"
+    rmdir "$LEGACY_GIT_CRED_DIR" 2>/dev/null || true
+    removed=1
   fi
-  if repo_reachable; then
-    ok "Deploy key đã có quyền đọc repo $REPO"
-    return 0
+  if [[ -f "$LEGACY_KEY" || -f "$LEGACY_KEY.pub" ]]; then
+    rm -f "$LEGACY_KEY" "$LEGACY_KEY.pub" "$LEGACY_KNOWN_HOSTS"
+    ok "Đã gỡ Deploy key cũ khỏi máy. Xoá luôn Deploy key trên GitHub: https://github.com/$REPO/settings/keys"
+    removed=1
   fi
-  say ""
-  say "   ${C_BLD}Thêm Deploy key vào GitHub (chỉ quyền ĐỌC):${C_RST}"
-  say "     1. Mở: ${C_BLU}https://github.com/$REPO/settings/keys/new${C_RST}"
-  say "     2. Title: Ads Agent VPS $(hostname -s 2>/dev/null || true)"
-  say "     3. Key: dán NGUYÊN dòng dưới đây (bắt đầu bằng ssh-ed25519)"
-  say "     4. KHÔNG tick \"Allow write access\" → bấm Add key"
-  say ""
-  printf '%s%s%s\n\n' "$C_GRN$C_BLD" "$(cat "$KEY.pub")" "$C_RST"
-  log "   (đã in public key Deploy key: $(ssh-keygen -lf "$KEY.pub" | awk '{print $2}'))"
-  while :; do
-    local ans=""
-    read -r -p "   Đã thêm Deploy key xong? Gõ Y rồi Enter để tiếp tục (Q để thoát): " ans </dev/tty || tty_closed
-    case "$ans" in
-      [Yy]*)
-        if repo_reachable; then
-          ok "Deploy key hoạt động: đọc được repo $REPO (nhánh $BRANCH)"
-          return 0
-        fi
-        warn "Chưa đọc được repo. Kiểm tra: đúng repo $REPO, dán đủ cả dòng key, đã bấm Add key. GitHub có thể mất vài giây."
-        ;;
-      [Qq]*) die "Đã thoát. Chạy lại script khi đã thêm Deploy key (key vẫn giữ nguyên: $KEY.pub)." ;;
-      *) info "Gõ Y rồi Enter khi đã thêm key, hoặc Q để thoát." ;;
-    esac
-  done
+  [[ -d "$DIR/.git" ]] && git_safe -C "$DIR" config --unset core.sshCommand >/dev/null 2>&1 || true
+  [[ $removed -eq 0 ]] || log "   đã gỡ cách xác thực cũ (Deploy key / git-auth)"
+  return 0
+}
+
+# Cài mới: luôn hỏi. update / reconfigure: dùng token đã lưu nếu còn hoạt động, hết hạn thì hỏi token mới.
+ensure_token() {
+  local mode=${1:-reuse}
+  if [[ "$mode" == "reuse" ]]; then
+    load_token
+    if [[ -n "$GH_TOKEN" ]]; then
+      if token_check; then
+        ok "Dùng token GitHub đã lưu của ${GH_USER:-tài khoản này}"
+        token_write_warning
+        return 0
+      fi
+      warn "Token GitHub đã lưu không dùng được: ${TOKEN_PROBLEM}."
+    elif [[ -f "$LEGACY_KEY" || "$(env_get ADS_AGENT_GIT_AUTH "$CONF")" == "key" ]]; then
+      warn "Bản cài này dùng Deploy key, cách này đã bỏ. Từ giờ Ads Agent dùng username + token classic GitHub (lưu trong .env)."
+    fi
+  fi
+  ask_token
 }
 
 set_repo_remote() {
-  if [[ "$GIT_AUTH" == "token" ]]; then
-    git -C "$DIR" config --unset core.sshCommand >/dev/null 2>&1 || true
-  else
-    git -C "$DIR" config core.sshCommand "$GIT_SSH"
-  fi
-  git -C "$DIR" remote set-url origin "$(repo_url)"
+  git_safe -C "$DIR" config --unset core.sshCommand >/dev/null 2>&1 || true
+  git_safe -C "$DIR" remote set-url origin "$(repo_url)"
 }
 
 fetch_source() {
   if [[ -d "$DIR/.git" ]]; then
     set_repo_remote
-    run_logged "git fetch" git_remote -C "$DIR" fetch --prune origin "$BRANCH" ||
-      die "git fetch thất bại (Deploy key bị gỡ hoặc token hết hạn?). Chạy lại: sudo ads-agent-deploy update"
-    if ! run_logged "git merge --ff-only" git -C "$DIR" merge --ff-only "origin/$BRANCH"; then
-      die "Thư mục $DIR có thay đổi cục bộ nên không cập nhật được. Xem: cd $DIR && git status"
+    check_local_git_config
+    run_logged "git fetch" git_https -C "$DIR" fetch --prune origin "$BRANCH" ||
+      die "git fetch thất bại (token hết hạn hoặc bị thu hồi?). Đổi token: sudo ads-agent-deploy token"
+    local bad
+    bad=$(git_safe -C "$DIR" diff --name-only -z HEAD "origin/$BRANCH" 2>/dev/null | sensitive_paths | head -n 5 | tr '\n' ' ' || true)
+    [[ -z "${bad// /}" ]] ||
+      die "Mã mới trên GitHub đụng tới file bí mật / dữ liệu riêng của máy chủ (${bad% }) nên không cập nhật: báo noti.vn."
+    # .env không bao giờ bị git ghi đè (--no-overwrite-ignore), vẫn giữ một bản sao trước khi đổi mã
+    [[ -f "$DIR/.env" ]] && cp -p "$DIR/.env" "$DIR/.env.bak"
+    if ! run_logged "git merge --ff-only" git_safe -C "$DIR" merge --ff-only --no-overwrite-ignore "origin/$BRANCH"; then
+      die "Thư mục $DIR có thay đổi cục bộ (hoặc file bị git bỏ qua trùng tên file mới) nên không cập nhật được. Xem: cd $DIR && git status"
     fi
-    ok "Mã nguồn đã cập nhật: $(git -C "$DIR" log -1 --format='%h %s' | cut -c1-80)"
+    ok "Mã nguồn đã cập nhật: $(git_safe -C "$DIR" log -1 --format='%h %s' | cut -c1-80)"
   elif [[ -e "$DIR" && -n "$(ls -A "$DIR" 2>/dev/null)" ]]; then
     die "Thư mục $DIR đã có dữ liệu nhưng không phải bản cài từ git. Đổi thư mục: sudo ADS_AGENT_DIR=/opt/ads-agent-2 bash $0"
   else
     install -d -m 755 "$(dirname "$DIR")"
-    run_logged "git clone" git_remote clone --branch "$BRANCH" --single-branch "$(repo_url)" "$DIR" ||
+    run_logged "git clone" git_https clone --branch "$BRANCH" --single-branch "$(repo_url)" "$DIR" ||
       die "git clone thất bại."
+    local bad
+    bad=$(git_safe -C "$DIR" ls-files -z 2>/dev/null | sensitive_paths | head -n 5 | tr '\n' ' ' || true)
+    if [[ -n "${bad// /}" ]]; then
+      # vừa clone trong lần chạy này: xoá để không dùng chung .env / khoá của repo cho máy này
+      rm -rf -- "$DIR"
+      die "Repo đang chứa file bí mật / dữ liệu riêng của máy chủ (${bad% }) nên không cài (mọi máy sẽ dùng chung khoá): báo noti.vn."
+    fi
     set_repo_remote
-    ok "Đã tải mã nguồn vào $DIR ($(git -C "$DIR" log -1 --format='%h' ))"
+    ok "Đã tải mã nguồn vào $DIR ($(git_safe -C "$DIR" log -1 --format='%h'))"
   fi
 }
 
@@ -836,7 +929,7 @@ create_env() {
     ok "Giữ nguyên .env đã có (secret và khoá mã hoá không đổi)"
     return 0
   fi
-  local args=(--domain "$DOMAIN" --email "$EMAIL" --ssl "$ACCESS" --no-updater)
+  local args=(--domain "$DOMAIN" --email "$EMAIL" --ssl "$ACCESS")
   [[ $GATEWAYS -eq 1 ]] || args+=(--no-gateway)
   (cd "$DIR" && export HOST_PROJECT_DIR="$DIR" && run_logged "gen-secrets" sh scripts/gen-secrets.sh "${args[@]}") ||
     die "Không tạo được .env."
@@ -846,19 +939,43 @@ create_env() {
   warn "Sao lưu riêng file $DIR/.env (nhất là ENCRYPTION_KEYS): mất nó thì không giải mã được kết nối đã lưu."
 }
 
+# Bật cập nhật bằng nút trên web: username/token + nguồn mã (UPDATE_*) và service updater (COMPOSE_PROFILES=updater).
+apply_update_env() {
+  save_token_env
+  env_set COMPOSE_PROFILES updater
+  env_set HOST_PROJECT_DIR "$DIR"
+  chmod 600 "$DIR/.env"
+  # thư mục docker login riêng mà updater mount chỉ đọc (bản build từ mã nguồn không cần đăng nhập GHCR)
+  install -d -m 700 "$UPDATER_DOCKER_DIR"
+  ok "Đã lưu username + token GitHub và nguồn cập nhật (nhánh $BRANCH của $REPO) vào $DIR/.env (quyền 600)"
+}
+
+# 0 = có yêu cầu cập nhật pending/running trong DB (system_update_requests). DB không chạy = không có.
+web_update_in_progress() {
+  local n
+  n=$(cd "$DIR" && docker compose exec -T db psql -U adsagent -d adsagent -tAc \
+    "SELECT count(*) FROM system_update_requests WHERE status IN ('pending', 'running')" 2>/dev/null | tr -dc '0-9' || true)
+  [[ -n "$n" && "$n" != "0" ]]
+}
+
+updater_image_present() {
+  local img ver
+  img=$(env_get APP_IMAGE)
+  ver=$(env_get APP_VERSION)
+  docker image inspect "${img:-ghcr.io/notivn/ads-agent-simple}-updater:$ver" >/dev/null 2>&1
+}
+
 build_and_start() {
   local ver
   ver=$(pkg_version)
   [[ -n "$ver" ]] || die "Không đọc được phiên bản trong $DIR/package.json."
   env_set APP_VERSION "$ver"
-  # image tự build không có chữ ký phát hành: tắt updater (cập nhật bằng `sudo ads-agent-deploy update`)
-  env_set COMPOSE_PROFILES ""
-  info "Đang build 3 image từ mã nguồn (lần đầu 5-15 phút, tuỳ cấu hình VPS)…"
+  info "Đang build image ứng dụng, gateway và updater từ mã nguồn (lần đầu 5-15 phút, tuỳ cấu hình VPS)…"
   local t0=$SECONDS
-  (export APP_BUILD_VERSION="$ver" && run_logged "docker compose build" dc_build build) ||
+  (export APP_BUILD_VERSION="$ver" COMPOSE_PROFILES=updater && run_logged "docker compose build" dc_build build) ||
     die "Build image thất bại. Thiếu RAM/ổ đĩa? Xem nhật ký: $LOG"
   ok "Build xong v$ver trong $(((SECONDS - t0) / 60)) phút"
-  info "Đang khởi động (database → migrate → web, worker, gateway, Caddy)…"
+  info "Đang khởi động (database → migrate → web, worker, gateway, updater, Caddy)…"
   run_logged "docker compose up" dc_build up -d --no-build --remove-orphans || die "docker compose up thất bại."
 }
 
@@ -904,14 +1021,15 @@ install_commands() {
   chmod 644 "$CONF"
   env_set ADS_AGENT_DIR "$DIR" "$CONF"
   env_set ADS_AGENT_SOURCE_BUILD 1 "$CONF"
-  env_set ADS_AGENT_GIT_AUTH "${GIT_AUTH:-key}" "$CONF"
+  env_set ADS_AGENT_GIT_AUTH token "$CONF"
   chmod 644 "$CONF"
-  ok "Đã cài lệnh: sudo ads-agent-deploy (cập nhật / đổi cách truy cập), sudo ads-agent (trạng thái, log, sao lưu…)"
+  ok "Đã cài lệnh: sudo ads-agent-deploy (cập nhật / đổi cách truy cập / đổi token), sudo ads-agent (trạng thái, log, sao lưu…)"
 }
 
+# chỉ image lơ lửng của Ads Agent (nhãn vn.noti.ads-agent=1, docker-compose.build.yml): không bao giờ dọn image /
+# build cache của Ads MCP hay dự án khác trên cùng máy (R19)
 prune_images() {
-  docker image prune -f >/dev/null 2>&1 || true
-  docker builder prune -f --filter until=168h >/dev/null 2>&1 || true
+  docker image prune -f --filter label=vn.noti.ads-agent=1 >/dev/null 2>&1 || true
 }
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -926,9 +1044,16 @@ final_screen() {
   printf '%s══════════════════════════════════════════════════════════════════%s\n' "$C_GRN$C_BLD" "$C_RST"
   printf '  1. Mở:              %shttps://%s/setup%s\n' "$C_BLD" "$DOMAIN" "$C_RST"
   printf '  2. Mã thiết lập:    %s%s%s\n' "$C_YLW$C_BLD" "${token:-<xem bằng: sudo ads-agent-deploy setup-key>}" "$C_RST"
-  printf '     (dán vào ô "Mã thiết lập (SETUP_TOKEN)", tạo quản trị viên rồi bật xác thực 2 bước)\n'
+  printf '     (dán vào ô "Mã thiết lập (SETUP_TOKEN)" rồi tạo quản trị viên)\n'
+  printf '     Bật xác thực 2 bước trong Tài khoản nếu muốn (khuyến nghị).\n'
   printf '  3. Làm theo trình hướng dẫn: kết nối Ads MCP → lõi AI → Telegram → đội mặc định.\n\n'
-  printf '  Cập nhật bản mới:   sudo ads-agent-deploy update\n'
+  printf '  Cập nhật bản mới:   bấm "Cập nhật ngay" ở trang Tổng quan (hoặc: sudo ads-agent-deploy update)\n'
+  printf '                      Bản mới = phiên bản trong package.json ở đầu nhánh %s của %s.\n' "$BRANCH" "$REPO"
+  if [[ $TG_BLOCKED -eq 1 && -z "$(env_get TELEGRAM_API_BASE_URL)" ]]; then
+    printf '  %sTelegram:%s           máy chủ không gọi được api.telegram.org - đặt proxy: sudo ads-agent-deploy reconfigure\n' "$C_YLW$C_BLD" "$C_RST"
+    printf '                      (cách tạo Cloudflare Worker: docs/huong-dan-telegram.md)\n'
+  fi
+  printf '  Đổi token GitHub:   sudo ads-agent-deploy token\n'
   printf '  Đổi cách truy cập:  sudo ads-agent-deploy reconfigure\n'
   printf '  Trạng thái / log:   sudo ads-agent status · sudo ads-agent logs web\n'
   printf '  Sao lưu:            sudo ads-agent backup   (nhớ sao lưu riêng %s/.env)\n' "$DIR"
@@ -943,13 +1068,13 @@ cmd_install() {
   ask_domain_email
   ask_access
   ask_gateways
-  ask_git_auth
+  [[ $TG_BLOCKED -eq 0 ]] || ask_telegram_proxy
   step "Gói hệ thống, Docker, swap"
   install_base
   install_docker
   ensure_swap
   step "Quyền đọc mã nguồn trên GitHub"
-  setup_source_auth
+  ensure_token ask
   step "Tải mã nguồn"
   fetch_source
   step "Cách truy cập Internet"
@@ -964,6 +1089,9 @@ cmd_install() {
   step "Cấu hình (.env)"
   create_env
   apply_access_env
+  apply_update_env
+  apply_telegram_env
+  cleanup_legacy_auth
   ok "Cách truy cập: $(access_label)"
   step "Build và khởi động"
   build_and_start
@@ -992,12 +1120,24 @@ current_access() {
 }
 
 cmd_update() {
-  STEP_TOTAL=4
+  STEP_TOTAL=5
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Cần quyền root. Chạy lại: sudo ads-agent-deploy update"
   [[ -f "$DIR/.env" && -d "$DIR/.git" ]] || die "Chưa có bản cài ở $DIR. Chạy: sudo bash deploy-vps.sh"
-  : >>"$LOG" 2>/dev/null || LOG=/dev/null
+  { : >>"$LOG" && chmod 600 "$LOG"; } 2>/dev/null || LOG=/dev/null
   DOMAIN=$(env_get APP_DOMAIN)
   ACCESS=$(current_access)
+  # một lần cập nhật bấm từ trang web (updater) đang chờ / đang chạy: không chạy song song (cùng sửa mã nguồn + image)
+  if web_update_in_progress; then
+    die "Đang có một lần cập nhật bấm từ trang web (Tổng quan → Cập nhật ngay) chờ hoặc đang chạy. Đợi nó xong (xem: sudo ads-agent logs updater) rồi chạy lại."
+  fi
+  if (cd "$DIR" && docker compose ps --status running --services 2>/dev/null | grep -qx updater); then
+    (cd "$DIR" && docker compose stop updater) >>"$LOG" 2>&1 && UPDATER_STOPPED=1 && info "Tạm dừng dịch vụ cập nhật của web trong lúc chạy lệnh này."
+  fi
+  step "Quyền đọc mã nguồn trên GitHub"
+  # token trong .env (bản cài cũ: /etc/ads-agent/git-auth hoặc Deploy key -> chuyển sang .env); hết hạn thì hỏi mới
+  ensure_token reuse
+  save_token_env
+  cleanup_legacy_auth
   step "Sao lưu database trước khi cập nhật"
   if (cd "$DIR" && docker compose ps --status running --services 2>/dev/null | grep -qx backup); then
     # shellcheck disable=SC2016
@@ -1011,27 +1151,21 @@ cmd_update() {
     warn "Dịch vụ backup không chạy: bỏ qua sao lưu."
   fi
   step "Tải mã mới nhất"
-  GIT_AUTH=$(env_get ADS_AGENT_GIT_AUTH "$CONF")
-  [[ -n "$GIT_AUTH" ]] || GIT_AUTH=key
-  if [[ "$GIT_AUTH" == "token" ]]; then
-    load_token
-    if ! token_check; then
-      warn "Token GitHub đã lưu không dùng được: ${TOKEN_PROBLEM}."
-      setup_token
-    fi
-  else
-    detect_github_ssh
-    pin_github_host_key
-  fi
-  local before after
-  before=$(git -C "$DIR" rev-parse --short HEAD)
+  local before after need_build=0
+  before=$(git_safe -C "$DIR" rev-parse --short HEAD)
   fetch_source
-  after=$(git -C "$DIR" rev-parse --short HEAD)
-  if [[ "$before" == "$after" ]] && ! ask_yn "Không có mã mới ($after). Vẫn build lại và khởi động lại?" N; then
-    ok "Không có gì thay đổi."
+  after=$(git_safe -C "$DIR" rev-parse --short HEAD)
+  # bản cài cũ chưa có image updater (cập nhật bằng nút trên web bị tắt): build để bật
+  updater_image_present || need_build=1
+  if [[ "$before" == "$after" && $need_build -eq 0 ]] && ! ask_yn "Không có mã mới ($after). Vẫn build lại và khởi động lại?" N; then
+    apply_update_env
+    run_logged "docker compose up worker updater" dc_build up -d --no-build worker updater ||
+      warn "Không khởi động lại được worker / updater: sudo ads-agent status"
+    ok "Không có mã mới. Cấu hình cập nhật trong .env đã được làm mới."
     exit 0
   fi
   step "Build và khởi động lại"
+  apply_update_env
   build_and_start
   step "Kiểm tra sức khoẻ"
   wait_healthy
@@ -1039,13 +1173,19 @@ cmd_update() {
   prune_images
   say ""
   ok "Đã cập nhật lên v$(pkg_version) ($after). Địa chỉ: https://$DOMAIN"
+  info "Lần sau: bấm \"Cập nhật ngay\" ở trang Tổng quan khi có bản mới (hoặc chạy lại lệnh này)."
 }
 
 cmd_reconfigure() {
-  STEP_TOTAL=4
+  STEP_TOTAL=5
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Cần quyền root. Chạy lại: sudo ads-agent-deploy reconfigure"
   [[ -f "$DIR/.env" ]] || die "Chưa có bản cài ở $DIR. Chạy: sudo bash deploy-vps.sh"
-  : >>"$LOG" 2>/dev/null || LOG=/dev/null
+  { : >>"$LOG" && chmod 600 "$LOG"; } 2>/dev/null || LOG=/dev/null
+  step "Quyền đọc mã nguồn trên GitHub"
+  ensure_token reuse
+  save_token_env
+  cleanup_legacy_auth
+  [[ -d "$DIR/.git" ]] && set_repo_remote
   step "Cách truy cập mới"
   info "Hiện tại: $(ACCESS="" access_label) · tên miền $(env_get APP_DOMAIN)"
   if ss -ltnH '( sport = :80 or sport = :443 )' 2>/dev/null | grep -q .; then
@@ -1062,7 +1202,19 @@ cmd_reconfigure() {
     cloudflare) collect_origin_cert ;;
   esac
   open_firewall
+  if ! telegram_reachable; then
+    warn "Không gọi được api.telegram.org (nhà mạng có thể chặn Telegram) — bot sẽ nhận tin nhưng không trả lời được. Cần proxy: xem docs/huong-dan-telegram.md"
+    ask_telegram_proxy
+  elif [[ -n "$(env_get TELEGRAM_API_BASE_URL)" ]]; then
+    ask_yn "Đang dùng proxy Telegram $(env_get TELEGRAM_API_BASE_URL). Đổi hoặc bỏ?" N && ask_telegram_proxy
+  fi
   apply_access_env
+  apply_telegram_env
+  if updater_image_present; then
+    apply_update_env
+  else
+    warn "Chưa có image updater (bản cài cũ): chạy sudo ads-agent-deploy update để bật nút cập nhật trên web."
+  fi
   step "Áp dụng"
   run_logged "docker compose up (reconfigure)" dc_build up -d --no-build --remove-orphans || die "docker compose up thất bại."
   (cd "$DIR" && docker compose restart caddy) >>"$LOG" 2>&1 || true
@@ -1070,6 +1222,30 @@ cmd_reconfigure() {
   wait_healthy
   check_public
   ok "Đã chuyển sang: $(access_label)"
+}
+
+cmd_token() {
+  STEP_TOTAL=2
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Cần quyền root. Chạy lại: sudo ads-agent-deploy token"
+  [[ -f "$DIR/.env" ]] || die "Chưa có bản cài ở $DIR. Chạy: sudo bash deploy-vps.sh"
+  { : >>"$LOG" && chmod 600 "$LOG"; } 2>/dev/null || LOG=/dev/null
+  step "Username + token GitHub mới"
+  load_token
+  ensure_token ask
+  save_token_env
+  cleanup_legacy_auth
+  [[ -d "$DIR/.git" ]] && set_repo_remote
+  ok "Đã lưu username + token mới vào $DIR/.env (quyền 600)"
+  step "Áp dụng cho worker (kiểm tra bản mới) và updater (tải mã + build)"
+  local svcs=(worker)
+  if updater_image_present; then
+    env_set COMPOSE_PROFILES updater
+    svcs+=(updater)
+  fi
+  run_logged "docker compose up ${svcs[*]}" dc_build up -d --no-build "${svcs[@]}" ||
+    die "docker compose up thất bại: sudo ads-agent status"
+  ok "Đã áp dụng. Kiểm tra trong web: Cài đặt → Cập nhật hệ thống → Kiểm tra ngay."
+  info "Nhớ xoá token cũ ở https://github.com/settings/tokens"
 }
 
 cmd_setup_key() {
@@ -1083,29 +1259,43 @@ cmd_setup_key() {
 
 cmd_help() {
   cat <<'EOF'
-Ads Agent by: noti.vn - triển khai nhanh lên VPS (Deploy key hoặc token GitHub, build trên VPS)
+Ads Agent by: noti.vn - triển khai nhanh lên VPS (username + token classic GitHub, build trên VPS)
   curl -fsSL https://raw.githubusercontent.com/notivn/ads-agent-simple-install/main/deploy.sh | sudo bash
-  sudo bash deploy-vps.sh              cài mới; máy đã cài thì hỏi: cập nhật / đổi cách truy cập
+  sudo bash deploy-vps.sh              cài mới; máy đã cài thì hỏi: cập nhật / đổi cách truy cập / đổi token
   sudo ads-agent-deploy update         kéo mã mới nhất + build lại + khởi động lại (dữ liệu giữ nguyên)
   sudo ads-agent-deploy reconfigure    đổi cách đưa web ra Internet (Tunnel / trỏ IP / proxy Cloudflare)
+  sudo ads-agent-deploy token          đổi username / token classic GitHub (lưu trong .env)
   sudo ads-agent-deploy setup-key      in lại mã thiết lập để tạo quản trị viên đầu tiên
+Sau khi cài, bản mới (version trong package.json ở đầu nhánh) cập nhật bằng nút "Cập nhật ngay" ở trang Tổng quan.
 Biến tuỳ chọn: ADS_AGENT_REPO (mặc định notivn/Ads-Agent-Simple), ADS_AGENT_BRANCH (main), ADS_AGENT_DIR (/opt/ads-agent)
 EOF
 }
 
 main() {
   local cmd=${1:-}
-  TMPD=$(mktemp -d)
+  # mọi file script tạo ra chỉ root đọc được (file cần quyền khác đặt mode rõ ràng; git chạy với umask 022)
+  umask 077
+  # nhật ký không bao giờ ghi qua symlink (có thể trỏ tới file khác của hệ thống)
+  [[ ! -L "$LOG" ]] || LOG=/dev/null
+  TMPD=$(mktemp -d /root/.ads-agent-deploy.XXXXXX 2>/dev/null || mktemp -d)
+  case "$cmd" in
+    help | -h | --help)
+      cmd_help
+      return 0
+      ;;
+  esac
+  resolve_source
   case "$cmd" in
     "" | install)
       if [[ -f "$DIR/.env" && -d "$DIR/.git" ]]; then
         printf '%sAds Agent đã được cài ở %s (tên miền %s).%s\n' "$C_BLD" "$DIR" "$(env_get APP_DOMAIN)" "$C_RST"
-        printf '   1) Cập nhật lên mã mới nhất\n   2) Đổi cách truy cập Internet\n   3) Thoát\n'
+        printf '   1) Cập nhật lên mã mới nhất\n   2) Đổi cách truy cập Internet\n   3) Đổi username / token GitHub\n   4) Thoát\n'
         tty_ok || die "Cần chạy trong terminal."
         ask "Chọn" "1"
         case "$REPLY" in
           1) cmd_update ;;
           2) cmd_reconfigure ;;
+          3) cmd_token ;;
           *) exit 0 ;;
         esac
       else
@@ -1115,8 +1305,8 @@ main() {
       ;;
     update) cmd_update ;;
     reconfigure) cmd_reconfigure ;;
+    token) cmd_token ;;
     setup-key) cmd_setup_key ;;
-    help | -h | --help) cmd_help ;;
     *) die "Lệnh không hợp lệ: $cmd. Xem: sudo bash $0 help" ;;
   esac
 }
