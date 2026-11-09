@@ -18,7 +18,7 @@
 # scripts/deploy-vps.sh của repo chính).
 # Cập nhật bằng nút trên web (.claude/docs/14-update-system.md §9): .env có UPDATE_GITHUB_USER, UPDATE_GITHUB_TOKEN,
 # UPDATE_REPO, UPDATE_SOURCE=branch, UPDATE_BRANCH và COMPOSE_PROFILES=updater (+ dịch vụ AI tuỳ chọn đang bật:
-# claude / chatgpt / gemini, luôn được giữ - sudo ads-agent ai enable). Bản mới = "version" trong package.json
+# claude / codex / chatgpt / gemini, luôn được giữ - sudo ads-agent ai enable). Bản mới = "version" trong package.json
 # ở đầu nhánh (tăng version + push là phát hành cho mọi VPS). Worker dùng token để kiểm tra bản mới, updater dùng nó
 # để git fetch rồi build image ngay trên VPS; container web không bao giờ nhận token.
 # 3 cách truy cập Internet (.claude/docs/13-deployment.md §3):
@@ -171,8 +171,8 @@ env_set() { # env_set KEY VALUE [file]
   mv -f "$tmp" "$file"
 }
 
-# COMPOSE_PROFILES with "updater" first + every other profile of .env kept (v0.6.0: the AI services claude / chatgpt /
-# gemini enabled with `sudo ads-agent ai enable` must survive update / reconfigure / token - 20 §8), deduplicated
+# COMPOSE_PROFILES with "updater" first + every other profile of .env kept (v0.6.0: the AI services claude / codex /
+# chatgpt / gemini enabled with `sudo ads-agent ai enable` must survive update / reconfigure / token - 20 §8), deduplicated
 profiles_with_updater() {
   local p out="updater" seen=",updater,"
   local -a arr=()
@@ -192,7 +192,7 @@ build_profiles() {
   local name out="updater"
   local -a arr=()
   IFS=',' read -r -a arr <<<"$(env_get COMPOSE_PROFILES)"
-  for name in claude chatgpt gemini; do
+  for name in claude codex chatgpt gemini; do
     [[ " ${arr[*]//[[:space:]]/} " == *" $name "* ]] || continue
     grep -qE "^  ai-$name:[[:space:]]*(#.*)?$" "$DIR/docker-compose.yml" 2>/dev/null || continue
     out+=",$name"
