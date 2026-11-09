@@ -14,7 +14,7 @@ Script tự làm hết, chỉ hỏi bạn vài câu:
    - DNS, kết nối GitHub qua HTTPS, Docker Hub;
    - kết nối Telegram (chỉ cảnh báo: nhà mạng chặn Telegram thì bot nhận tin nhưng không trả lời được);
    - Docker và Compose;
-   - cổng 80 / 443;
+   - cổng 80 / 443 (đang bị chương trình nào dùng; cổng bận thì chỉ cho chọn Cloudflare Tunnel);
    - đồng hồ hệ thống, tường lửa;
    - Ads MCP và bản cài cũ trên máy.
 
@@ -33,7 +33,7 @@ Script tự làm hết, chỉ hỏi bạn vài câu:
    - mở tường lửa;
    - tải mã nguồn;
    - tạo `.env` với secret ngẫu nhiên, username + token GitHub và nguồn cập nhật (quyền 600, chỉ root đọc được);
-   - build và chạy (kể cả dịch vụ cập nhật);
+   - build và chạy (kể cả dịch vụ cập nhật); ngay trước khi chạy, kiểm lại cổng 80 / 443 một lần nữa và báo rõ nếu vừa có chương trình khác chiếm;
    - kiểm tra sức khoẻ.
 4. **In ra địa chỉ** `https://<tên miền>/setup` cùng **mã thiết lập**, để bạn tạo tài khoản quản trị đầu tiên. Xác thực 2 bước là tuỳ chọn: bật trong Tài khoản nếu muốn (khuyến nghị).
 
@@ -50,6 +50,7 @@ Sau khi cài, bản mới là phiên bản ghi trong `package.json` ở đầu n
 | `sudo ads-agent-deploy reconfigure` | Đổi cách truy cập Internet, đặt / bỏ proxy Telegram |
 | `sudo ads-agent-deploy setup-key` | Xem lại mã thiết lập |
 | `sudo ads-agent status` · `logs web` · `backup` | Trạng thái, nhật ký, sao lưu |
+| `sudo ads-agent doctor` | Tự kiểm tra toàn bộ (dịch vụ, cổng, HTTPS, token, sao lưu, ổ đĩa) và gợi ý cách sửa |
 
 Bản cài cũ dùng Deploy key: chạy `sudo ads-agent-deploy update`, nhập username + token khi được hỏi. Script tự chuyển sang token, gỡ khoá cũ trên máy và bật nút cập nhật trên web; sau đó xoá Deploy key trên GitHub (Settings → Deploy keys của repo).
 

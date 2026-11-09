@@ -13,11 +13,12 @@
 # Các bước: bảng kiểm tra máy (root, OS, RAM/ổ đĩa, mạng GitHub/Docker Hub, Docker, cổng 80/443, đồng hồ, tường lửa,
 # Ads MCP) → hỏi tên miền + cách truy cập → cài Docker → username + token classic GitHub (quyền repo, gõ ẩn, kiểm
 # bằng API) → tải mã nguồn → tạo .env (secret ngẫu nhiên + username/token/nguồn cập nhật) → chứng chỉ / token theo
-# cách truy cập → build 4 image (app, gateway, updater) → chạy → kiểm tra sức khoẻ → in địa chỉ /setup và mã thiết
+# cách truy cập → build 2 image (app, updater) → chạy → kiểm tra sức khoẻ → in địa chỉ /setup và mã thiết
 # lập. Bản công khai deploy.sh ở repo notivn/ads-agent-simple-install là bản chép NGUYÊN file này (nguồn duy nhất:
 # scripts/deploy-vps.sh của repo chính).
 # Cập nhật bằng nút trên web (.claude/docs/14-update-system.md §9): .env có UPDATE_GITHUB_USER, UPDATE_GITHUB_TOKEN,
-# UPDATE_REPO, UPDATE_SOURCE=branch, UPDATE_BRANCH và COMPOSE_PROFILES=updater. Bản mới = "version" trong package.json
+# UPDATE_REPO, UPDATE_SOURCE=branch, UPDATE_BRANCH và COMPOSE_PROFILES=updater (+ dịch vụ AI tuỳ chọn đang bật:
+# claude / chatgpt / gemini, luôn được giữ - sudo ads-agent ai enable). Bản mới = "version" trong package.json
 # ở đầu nhánh (tăng version + push là phát hành cho mọi VPS). Worker dùng token để kiểm tra bản mới, updater dùng nó
 # để git fetch rồi build image ngay trên VPS; container web không bao giờ nhận token.
 # 3 cách truy cập Internet (.claude/docs/13-deployment.md §3):
@@ -51,7 +52,7 @@ LEGACY_GIT_CRED_DIR="/etc/ads-agent"
 LEGACY_GIT_CRED="$LEGACY_GIT_CRED_DIR/git-auth"
 MIN_MEM_MB=4096 # RAM + swap tối thiểu để build image Next.js trên VPS
 
-DOMAIN="" EMAIL="" ACCESS="" GATEWAYS=1 TUNNEL_TOKEN_VALUE="" CERT_PEM="" KEY_PEM="" PUBLIC_IP=""
+DOMAIN="" EMAIL="" ACCESS="" TUNNEL_TOKEN_VALUE="" CERT_PEM="" KEY_PEM="" PUBLIC_IP=""
 PORTS_BUSY=0 PORTS_BUSY_BY="" OS_ID="" TMPD="" TG_BLOCKED=0 TG_PROXY="" TG_PROXY_SET=0
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -170,6 +171,35 @@ env_set() { # env_set KEY VALUE [file]
   mv -f "$tmp" "$file"
 }
 
+# COMPOSE_PROFILES with "updater" first + every other profile of .env kept (v0.6.0: the AI services claude / chatgpt /
+# gemini enabled with `sudo ads-agent ai enable` must survive update / reconfigure / token - 20 §8), deduplicated
+profiles_with_updater() {
+  local p out="updater" seen=",updater,"
+  local -a arr=()
+  IFS=',' read -r -a arr <<<"$(env_get COMPOSE_PROFILES)"
+  for p in "${arr[@]}"; do
+    p=${p//[[:space:]]/}
+    [[ -n "$p" && "$p" =~ ^[A-Za-z0-9_.-]+$ && "$seen" != *",$p,"* ]] || continue
+    seen+="$p,"
+    out+=",$p"
+  done
+  printf '%s' "$out"
+}
+
+# COMPOSE_PROFILES of the source build: updater + the enabled AI profiles whose service docker-compose.yml (of the
+# code just fetched) defines - their image (${APP_IMAGE}-gateway, from gateway/) is built with the app; nothing else.
+build_profiles() {
+  local name out="updater"
+  local -a arr=()
+  IFS=',' read -r -a arr <<<"$(env_get COMPOSE_PROFILES)"
+  for name in claude chatgpt gemini; do
+    [[ " ${arr[*]//[[:space:]]/} " == *" $name "* ]] || continue
+    grep -qE "^  ai-$name:[[:space:]]*(#.*)?$" "$DIR/docker-compose.yml" 2>/dev/null || continue
+    out+=",$name"
+  done
+  printf '%s' "$out"
+}
+
 run_logged() { # run_logged "mô tả" lệnh... : chạy, ghi log; lỗi thì in 25 dòng cuối
   local desc=$1
   shift
@@ -272,7 +302,7 @@ precheck() {
   fi
   if telegram_reachable; then pf_ok "Kết nối Telegram (api.telegram.org)"; else
     TG_BLOCKED=1
-    pf_warn "Không gọi được api.telegram.org (nhà mạng có thể chặn Telegram) — bot sẽ nhận tin nhưng không trả lời được. Cần proxy: xem docs/huong-dan-telegram.md"
+    pf_warn "Không gọi được api.telegram.org (nhà mạng có thể chặn Telegram) - bot sẽ nhận tin nhưng không trả lời được. Cần proxy: xem docs/huong-dan-telegram.md"
   fi
 
   # --- đồng hồ (mã xác thực 2 bước - nếu bật - và chứng chỉ SSL cần giờ đúng)
@@ -462,12 +492,6 @@ apply_telegram_env() {
   env_set TELEGRAM_API_BASE_URL "$TG_PROXY"
   chmod 600 "$DIR/.env"
   if [[ -n "$TG_PROXY" ]]; then ok "Đã ghi TELEGRAM_API_BASE_URL vào .env"; else ok "Đã bỏ TELEGRAM_API_BASE_URL trong .env"; fi
-}
-
-ask_gateways() {
-  say ""
-  info "Gateway ChatGPT / Gemini cho phép agent dùng tài khoản ChatGPT / Gemini (web) thay cho API key (tốn thêm ~250 MB RAM)."
-  if ask_yn "Bật gateway ChatGPT / Gemini?" Y; then GATEWAYS=1; else GATEWAYS=0; fi
 }
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -899,6 +923,58 @@ open_firewall() {
   fi
 }
 
+# ------------------------------------------------------------------------------------------------------------------
+# Cổng (2026-11-09): ai đang giữ cổng nào, kiểm lại ngay trước `docker compose up`
+# ------------------------------------------------------------------------------------------------------------------
+# port_busy PORT: có chương trình trên máy đang nghe TCP PORT (mọi địa chỉ, kể cả docker-proxy của cổng publish)
+port_busy() { [[ -n "$(ss -Hltn "( sport = :$1 )" 2>/dev/null || true)" ]]; }
+
+# port_users PORT...: tên các chương trình đang nghe các cổng đó ("" khi trống / không rõ)
+port_users() {
+  local port out all=""
+  for port in "$@"; do
+    out=$(ss -Hltnp "( sport = :$port )" 2>/dev/null || true)
+    [[ -n "$out" ]] && all+=" $(grep -o 'users:(("[^"]*"' <<<"$out" | sed 's/users:(("//; s/"$//' | tr '\n' ' ' || true)"
+  done
+  # tên do chương trình khác đặt (comm): chỉ giữ ký tự in được trước khi ra màn hình root / log
+  tr ' ' '\n' <<<"$all" | sed '/^$/d' | sort -u | tr '\n' ' ' | LC_ALL=C tr -cd 'A-Za-z0-9._ -' | sed 's/ $//' || true
+}
+
+# held_by_us SERVICE CONTAINER_PORT HOST_PORT: container SERVICE của Ads Agent đang publish CONTAINER_PORT ra HOST_PORT
+held_by_us() {
+  [[ -f "$DIR/.env" ]] || return 1
+  local bound
+  bound=$(dc_build port "$1" "$2" 2>/dev/null | head -n 1 || true)
+  [[ -n "$bound" && "$bound" == *":$3" ]]
+}
+
+# ensure_ports_before_up: ngay trước `docker compose up`. Cách 2/3 (Caddy mở 80/443 ra Internet) mà cổng vừa bị chương
+# trình khác giữ → báo rõ ai đang giữ + cách xử lý, thay vì lỗi "address already in use" khó hiểu của Docker. 80/443
+# không bao giờ đổi sang số khác: Let's Encrypt, trình duyệt và proxy Cloudflare cần đúng 80/443. Cách 1 (Tunnel) không
+# mở cổng nào (Caddy chỉ nghe 127.0.0.1, cổng do Docker tự chọn) nên không bao giờ trùng.
+# bind_port BIND DEFAULT: cổng trên máy của một binding compose "[IP:]cổng" (CADDY_HTTP_PORT_BIND…); "" = không mở ra
+# Internet (127.0.0.1:… = Cloudflare Tunnel, Docker tự chọn cổng nội bộ) hoặc không phải số
+bind_port() {
+  local bind=${1:-$2}
+  [[ "$bind" == 127.0.0.1:* ]] && return 0
+  bind=${bind##*:}
+  [[ "$bind" =~ ^[0-9]+$ ]] && printf '%s' "$bind"
+  return 0
+}
+
+ensure_ports_before_up() {
+  local users http https
+  [[ "$(env_get CADDY_REPLICAS)" == "0" ]] && return 0
+  http=$(bind_port "$(env_get CADDY_HTTP_PORT_BIND)" 80)
+  https=$(bind_port "$(env_get CADDY_HTTPS_PORT_BIND)" 443)
+  if { [[ -n "$http" ]] && port_busy "$http" && ! held_by_us caddy 80 "$http"; } ||
+    { [[ -n "$https" ]] && port_busy "$https" && ! held_by_us caddy 443 "$https"; }; then
+    users=$(port_users $http $https)
+    die "Cổng $http/$https đang bị ${users:-chương trình khác} dùng nên Caddy của Ads Agent không mở được. Không đổi sang cổng khác được (Let's Encrypt, trình duyệt và Cloudflare cần đúng 80/443). Cách xử lý: tắt chương trình đó (nếu không phải Ads MCP), hoặc chọn cách 1 Cloudflare Tunnel (không cần cổng nào): sudo ads-agent-deploy reconfigure"
+  fi
+  return 0
+}
+
 apply_access_env() {
   # cùng giá trị với SSL_PRESETS của scripts/gen-env.mjs (cách 1 = tunnel, 2 = auto, 3 = cloudflare)
   local site="" http="80" https="443" cf=0 clientip=direct tls=auto
@@ -930,7 +1006,6 @@ create_env() {
     return 0
   fi
   local args=(--domain "$DOMAIN" --email "$EMAIL" --ssl "$ACCESS")
-  [[ $GATEWAYS -eq 1 ]] || args+=(--no-gateway)
   (cd "$DIR" && export HOST_PROJECT_DIR="$DIR" && run_logged "gen-secrets" sh scripts/gen-secrets.sh "${args[@]}") ||
     die "Không tạo được .env."
   [[ -s "$DIR/.env" ]] || die "Không thấy $DIR/.env sau khi sinh."
@@ -942,7 +1017,7 @@ create_env() {
 # Bật cập nhật bằng nút trên web: username/token + nguồn mã (UPDATE_*) và service updater (COMPOSE_PROFILES=updater).
 apply_update_env() {
   save_token_env
-  env_set COMPOSE_PROFILES updater
+  env_set COMPOSE_PROFILES "$(profiles_with_updater)"
   env_set HOST_PROJECT_DIR "$DIR"
   chmod 600 "$DIR/.env"
   # thư mục docker login riêng mà updater mount chỉ đọc (bản build từ mã nguồn không cần đăng nhập GHCR)
@@ -969,13 +1044,21 @@ build_and_start() {
   local ver
   ver=$(pkg_version)
   [[ -n "$ver" ]] || die "Không đọc được phiên bản trong $DIR/package.json."
+  info "Đang build image ứng dụng và updater từ mã nguồn (lần đầu 5-15 phút, tuỳ cấu hình VPS)…"
+  local t0=$SECONDS profiles
+  # updater + the AI services enabled with `sudo ads-agent ai enable` (their image is built from gateway/ only then)
+  profiles=$(build_profiles)
+  [[ "$profiles" == updater ]] || info "Dịch vụ AI đang bật: ${profiles#updater,} - build thêm image dịch vụ AI (thư mục gateway/)"
+  # APP_VERSION only in the build's env: .env keeps the running version until the new images exist
+  (export APP_VERSION="$ver" APP_BUILD_VERSION="$ver" COMPOSE_PROFILES="$profiles" && run_logged "docker compose build" dc_build build) ||
+    die "Build image thất bại (thường do mạng tải gói chập chờn, thiếu RAM hoặc ổ đĩa). Bản đang chạy không bị ảnh hưởng. Chạy lại đúng lệnh vừa rồi để thử tiếp — phần đã build được giữ trong cache. Nhật ký: $LOG"
   env_set APP_VERSION "$ver"
-  info "Đang build image ứng dụng, gateway và updater từ mã nguồn (lần đầu 5-15 phút, tuỳ cấu hình VPS)…"
-  local t0=$SECONDS
-  (export APP_BUILD_VERSION="$ver" COMPOSE_PROFILES=updater && run_logged "docker compose build" dc_build build) ||
-    die "Build image thất bại. Thiếu RAM/ổ đĩa? Xem nhật ký: $LOG"
   ok "Build xong v$ver trong $(((SECONDS - t0) / 60)) phút"
-  info "Đang khởi động (database → migrate → web, worker, gateway, updater, Caddy)…"
+  info "Đang khởi động (database → migrate → web, worker, updater, Caddy)…"
+  # --remove-orphans (COMPOSE_PROFILES from .env: updater + the enabled AI profiles, kept by profiles_with_updater):
+  # also removes the gateway-chatgpt / gateway-gemini containers of installs <= 0.2.x (gateways removed in 0.3.0);
+  # volumes are never removed (docs/van-hanh.md). The ai-* services are defined in docker-compose.yml: not orphans.
+  ensure_ports_before_up
   run_logged "docker compose up" dc_build up -d --no-build --remove-orphans || die "docker compose up thất bại."
 }
 
@@ -1067,7 +1150,6 @@ cmd_install() {
   step "Thông tin triển khai"
   ask_domain_email
   ask_access
-  ask_gateways
   [[ $TG_BLOCKED -eq 0 ]] || ask_telegram_proxy
   step "Gói hệ thống, Docker, swap"
   install_base
@@ -1203,7 +1285,7 @@ cmd_reconfigure() {
   esac
   open_firewall
   if ! telegram_reachable; then
-    warn "Không gọi được api.telegram.org (nhà mạng có thể chặn Telegram) — bot sẽ nhận tin nhưng không trả lời được. Cần proxy: xem docs/huong-dan-telegram.md"
+    warn "Không gọi được api.telegram.org (nhà mạng có thể chặn Telegram) - bot sẽ nhận tin nhưng không trả lời được. Cần proxy: xem docs/huong-dan-telegram.md"
     ask_telegram_proxy
   elif [[ -n "$(env_get TELEGRAM_API_BASE_URL)" ]]; then
     ask_yn "Đang dùng proxy Telegram $(env_get TELEGRAM_API_BASE_URL). Đổi hoặc bỏ?" N && ask_telegram_proxy
@@ -1216,6 +1298,7 @@ cmd_reconfigure() {
     warn "Chưa có image updater (bản cài cũ): chạy sudo ads-agent-deploy update để bật nút cập nhật trên web."
   fi
   step "Áp dụng"
+  ensure_ports_before_up
   run_logged "docker compose up (reconfigure)" dc_build up -d --no-build --remove-orphans || die "docker compose up thất bại."
   (cd "$DIR" && docker compose restart caddy) >>"$LOG" 2>&1 || true
   step "Kiểm tra"
@@ -1239,7 +1322,7 @@ cmd_token() {
   step "Áp dụng cho worker (kiểm tra bản mới) và updater (tải mã + build)"
   local svcs=(worker)
   if updater_image_present; then
-    env_set COMPOSE_PROFILES updater
+    env_set COMPOSE_PROFILES "$(profiles_with_updater)"
     svcs+=(updater)
   fi
   run_logged "docker compose up ${svcs[*]}" dc_build up -d --no-build "${svcs[@]}" ||
@@ -1311,4 +1394,9 @@ main() {
   esac
 }
 
-main "$@"
+# `source deploy-vps.sh` (tests: scripts/ports.test.ts) only loads the functions: `return` works only when sourced. Never
+# a BASH_SOURCE / env-var check: under `curl … | sudo bash` BASH_SOURCE[0] is empty, and a leftover exported variable
+# would make the one-line install silently do nothing.
+if ! (return 0 2>/dev/null); then
+  main "$@"
+fi
