@@ -50,7 +50,14 @@ LEGACY_KEY="/root/.ssh/ads_agent_deploy_ed25519"
 LEGACY_KNOWN_HOSTS="/root/.ssh/known_hosts_ads_agent"
 LEGACY_GIT_CRED_DIR="/etc/ads-agent"
 LEGACY_GIT_CRED="$LEGACY_GIT_CRED_DIR/git-auth"
-MIN_MEM_MB=4096 # RAM + swap tối thiểu để build image Next.js trên VPS
+MIN_MEM_MB=12288 # RAM + swap lúc build image Next.js trên VPS (= BUILD_MIN_MEM_MB của updater-core.ts; 5 GB từng bị OOM, exit 137)
+PERM_SWAP_MB=5120 # swap thường trực tối đa (giữ luôn, fstab) - chủ dự án quyết 2026-11-12
+BUILD_SWAP_MAX_MB=5120 # swap tạm tối đa, chỉ bật trong lúc build rồi gỡ - chủ dự án quyết 2026-11-12
+MIN_DISK_FREE_GB=10 # ổ đĩa luôn chừa lại sau khi tạo swap (image Docker + cache build)
+SWAP_FILE="/swapfile-ads-agent" # swap thường trực; bù thêm = "$SWAP_FILE-2"
+BUILD_SWAP_FILE="/swapfile-ads-agent-build" # swap tạm của lúc build (không bao giờ ghi fstab)
+FSTAB="/etc/fstab"
+BUILD_SWAP_ON=0
 
 DOMAIN="" EMAIL="" ACCESS="" TUNNEL_TOKEN_VALUE="" CERT_PEM="" KEY_PEM="" PUBLIC_IP=""
 PORTS_BUSY=0 PORTS_BUSY_BY="" OS_ID="" TMPD="" TG_BLOCKED=0 TG_PROXY="" TG_PROXY_SET=0
@@ -85,6 +92,8 @@ cleanup() {
   [[ -n "$TMPD" && -d "$TMPD" ]] && rm -rf "$TMPD"
   # cmd_update tạm dừng updater: bật lại kể cả khi dừng giữa chừng
   if [[ $UPDATER_STOPPED -eq 1 ]]; then (cd "$DIR" && docker compose start updater) >/dev/null 2>&1 || true; fi
+  # swap tạm của lúc build: gỡ cả khi build lỗi / dừng giữa chừng (build_swap_off tự kiểm an toàn, không bao giờ lỗi)
+  if [[ $BUILD_SWAP_ON -eq 1 ]]; then build_swap_off || true; fi
   return 0
 }
 trap cleanup EXIT
@@ -361,27 +370,177 @@ precheck() {
   ok "Máy chủ đạt yêu cầu."
 }
 
+# Swap (chủ dự án quyết 2026-11-12): build Next.js trên VPS cần RAM + swap ≥ MIN_MEM_MB (VPS 2 GB RAM, RAM + swap 5 GB
+# bị OOM ở bước kiểm TypeScript, exit 137). Chia làm 2 phần:
+#  - swap THƯỜNG TRỰC tối đa PERM_SWAP_MB (5 GB, $SWAP_FILE, bù bằng $SWAP_FILE-2 khi máy đã có file cũ nhỏ hơn; ghi
+#    fstab): đỡ RAM lúc chạy bình thường (Postgres + web + worker + Caddy trên VPS 2 GB);
+#  - swap TẠM tối đa BUILD_SWAP_MAX_MB (5 GB, $BUILD_SWAP_FILE, KHÔNG ghi fstab): chỉ bật trong lúc `docker compose
+#    build` (build_swap_on / build_swap_off), gỡ ngay sau build - thành công hay lỗi (trap EXIT) - khi gỡ an toàn.
+# Cả hai chỉ tạo phần còn thiếu để RAM + swap đạt MIN_MEM_MB (máy nhiều RAM: ít hoặc không tạo) và luôn chừa
+# MIN_DISK_FREE_GB ổ đĩa cho image Docker + cache build. Nút "Cập nhật ngay" trên web (updater trong container, không
+# tạo được swap của máy chủ) từ chối build khi RAM + swap < MIN_MEM_MB (scripts/updater-core.ts BUILD_MIN_MEM_MB).
+
+# meminfo_mb KEY: a /proc/meminfo value (MemTotal, SwapTotal, MemAvailable…) in MB
+meminfo_mb() { awk -v k="$1:" '$1 == k {printf "%d", $2/1024}' /proc/meminfo; }
+# proc_swaps: active swap areas (Filename Type Size Used Priority, sizes in KB)
+proc_swaps() { cat /proc/swaps 2>/dev/null || true; }
+swap_active() { proc_swaps | awk -v f="$1" 'NR > 1 && $1 == f {found = 1} END {exit !found}'; }
+# swaps_readable: /proc/swaps answers (an LXC-style /proc without it: never guess which file is active)
+swaps_readable() { proc_swaps | head -n 1 | grep -q '^Filename'; }
+# swap_file_mb FILE: size in MB of an ACTIVE swap file (0 = not active)
+swap_file_mb() { proc_swaps | awk -v f="$1" 'NR > 1 && $1 == f {printf "%d", $3 / 1024; found = 1} END {if (!found) print 0}'; }
+# fstab_add FILE: one "FILE none swap sw 0 0" line (never glued to a last line that has no newline)
+fstab_add() {
+  grep -q "^$1[[:space:]]" "$FSTAB" 2>/dev/null && return 0
+  if [[ -s "$FSTAB" && -n "$(tail -c 1 "$FSTAB")" ]]; then printf '\n' >>"$FSTAB"; fi
+  printf '%s none swap sw 0 0\n' "$1" >>"$FSTAB"
+}
+
+# swap_size_mb WANT_MB: WANT_MB rounded to the nearest GB (a 3 GB file shows as 3071 MB: no extra GB for 1 MB), cut to what the disk can give while keeping MIN_DISK_FREE_GB
+# free (prints 0 when it cannot give 1 GB)
+swap_size_mb() {
+  local size=$((($1 + 511) / 1024 * 1024)) disk room
+  disk=$(df -BM --output=avail / 2>/dev/null | tail -n 1 | tr -dc '0-9' || true)
+  room=$(((${disk:-0} - MIN_DISK_FREE_GB * 1024) / 1024 * 1024))
+  [[ $room -lt $size ]] && size=$room
+  [[ $size -ge 1024 ]] || size=0
+  printf '%s' "$size"
+}
+
+# make_swap FILE SIZE_MB: create + mkswap + swapon (no fstab); 1 = failed (file removed). A fallocated file that the
+# filesystem refuses as swap (btrfs / zfs) is made again once with dd.
+make_swap() {
+  local how
+  for how in fallocate dd; do
+    rm -f "$1"
+    if [[ $how == fallocate ]]; then
+      run_logged "fallocate swap" fallocate -l "$2M" "$1" || continue
+    else
+      run_logged "dd swap" dd if=/dev/zero of="$1" bs=1M count="$2" || break
+    fi
+    chmod 600 "$1"
+    if run_logged "mkswap" mkswap "$1" && run_logged "swapon" swapon "$1"; then return 0; fi
+  done
+  rm -f "$1"
+  return 1
+}
+
 ensure_swap() {
-  local mem_mb swap_mb need_mb size_mb
-  mem_mb=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
-  swap_mb=$(awk '/SwapTotal/ {printf "%d", $2/1024}' /proc/meminfo)
-  need_mb=$((MIN_MEM_MB - mem_mb - swap_mb))
-  [[ $need_mb -gt 0 ]] || { ok "RAM + swap đủ để build (${mem_mb} + ${swap_mb} MB)"; return 0; }
-  size_mb=$(((need_mb / 1024 + 1) * 1024))
-  [[ $size_mb -ge 2048 ]] || size_mb=2048
-  if [[ -f /swapfile-ads-agent ]]; then
-    warn "Đã có /swapfile-ads-agent nhưng RAM + swap vẫn dưới $MIN_MEM_MB MB. Build có thể chậm."
+  local mem_mb swap_mb need_mb size_mb file="" f
+  # a temporary build swap left by a killed run is never counted as permanent (one kept because it could not be
+  # removed safely: its size is subtracted below)
+  build_swap_off
+  # our permanent files: one that exists but is off (killed between swapon and fstab, swapoff by hand) is turned on
+  # again or removed; an active one always gets its fstab line
+  if swaps_readable; then
+    for f in "$SWAP_FILE" "$SWAP_FILE-2"; do
+      [[ -e "$f" ]] || continue
+      if ! swap_active "$f"; then
+        if ! run_logged "swapon $f" swapon "$f"; then
+          rm -f "$f"
+          continue
+        fi
+      fi
+      fstab_add "$f"
+    done
+  fi
+  mem_mb=$(meminfo_mb MemTotal)
+  swap_mb=$(meminfo_mb SwapTotal)
+  mem_mb=${mem_mb:-0} swap_mb=${swap_mb:-0}
+  swap_mb=$((swap_mb - $(swap_file_mb "$BUILD_SWAP_FILE")))
+  need_mb=$((PERM_SWAP_MB - swap_mb))
+  [[ $((MIN_MEM_MB - mem_mb - swap_mb)) -lt $need_mb ]] && need_mb=$((MIN_MEM_MB - mem_mb - swap_mb))
+  # less than 512 MB short = enough (swap headers, rounding)
+  if [[ $need_mb -lt 512 ]]; then
+    ok "Swap thường trực đủ (RAM ${mem_mb} MB, swap ${swap_mb} MB)"
     return 0
   fi
-  info "RAM + swap dưới $MIN_MEM_MB MB: tạo thêm swap ${size_mb} MB để build không bị thiếu bộ nhớ…"
-  run_logged "fallocate swap" fallocate -l "${size_mb}M" /swapfile-ads-agent ||
-    run_logged "dd swap" dd if=/dev/zero of=/swapfile-ads-agent bs=1M count="$size_mb" ||
-    die "Không tạo được file swap (thiếu dung lượng ổ đĩa?)."
-  chmod 600 /swapfile-ads-agent
-  run_logged "mkswap" mkswap /swapfile-ads-agent || die "mkswap thất bại."
-  run_logged "swapon" swapon /swapfile-ads-agent || die "swapon thất bại."
-  grep -q '^/swapfile-ads-agent ' /etc/fstab || printf '/swapfile-ads-agent none swap sw 0 0\n' >>/etc/fstab
-  ok "Đã bật swap ${size_mb} MB (/swapfile-ads-agent, tự bật lại khi khởi động máy)"
+  size_mb=$(swap_size_mb "$need_mb")
+  if [[ $size_mb -eq 0 ]]; then
+    warn "Ổ đĩa không đủ chỗ tạo swap thường trực (cần chừa ${MIN_DISK_FREE_GB} GB cho Docker). Máy RAM ${mem_mb} MB có thể thiếu bộ nhớ: tăng ổ đĩa hoặc RAM."
+    return 0
+  fi
+  if [[ ! -e "$SWAP_FILE" ]]; then
+    file=$SWAP_FILE
+  elif [[ ! -e "$SWAP_FILE-2" ]]; then
+    file=$SWAP_FILE-2
+  else
+    warn "Đã có $SWAP_FILE và $SWAP_FILE-2 nhưng swap mới có ${swap_mb} MB: giữ nguyên."
+    return 0
+  fi
+  info "Tạo swap thường trực ${size_mb} MB ($file) cho máy RAM ${mem_mb} MB…"
+  # never fatal (an LXC / OpenVZ VPS refuses swapon): a build may still pass, and an update must stay possible
+  if ! make_swap "$file" "$size_mb"; then
+    warn "Không tạo được swap $file (máy ảo không cho bật swap, hoặc thiếu ổ đĩa). Tiếp tục không có swap này - build có thể thiếu bộ nhớ."
+    return 0
+  fi
+  fstab_add "$file"
+  ok "Đã bật swap thường trực ${size_mb} MB ($file, tự bật lại khi khởi động máy)"
+}
+
+# build_swap_on: right before `docker compose build` - temporary swap up to BUILD_SWAP_MAX_MB so RAM + swap reaches
+# MIN_MEM_MB. Never fatal: without it the build may still pass (a failure says to add swap).
+build_swap_on() {
+  local mem_mb swap_mb need_mb size_mb
+  if ! swaps_readable; then
+    warn "Không đọc được /proc/swaps: không bật swap tạm cho lúc build."
+    return 0
+  fi
+  if swap_active "$BUILD_SWAP_FILE"; then
+    BUILD_SWAP_ON=1
+    return 0
+  fi
+  rm -f "$BUILD_SWAP_FILE" # inactive leftover (killed run, reboot)
+  mem_mb=$(meminfo_mb MemTotal)
+  swap_mb=$(meminfo_mb SwapTotal)
+  mem_mb=${mem_mb:-0} swap_mb=${swap_mb:-0}
+  need_mb=$((MIN_MEM_MB - mem_mb - swap_mb))
+  [[ $need_mb -ge 512 ]] || return 0
+  [[ $need_mb -le $BUILD_SWAP_MAX_MB ]] || need_mb=$BUILD_SWAP_MAX_MB
+  size_mb=$(swap_size_mb "$need_mb")
+  if [[ $size_mb -eq 0 ]]; then
+    warn "Ổ đĩa không đủ chỗ bật swap tạm cho lúc build (RAM ${mem_mb} MB + swap ${swap_mb} MB). Build có thể thiếu bộ nhớ."
+    return 0
+  fi
+  info "Bật swap tạm ${size_mb} MB trong lúc build (RAM ${mem_mb} MB + swap ${swap_mb} MB, cần ${MIN_MEM_MB} MB)…"
+  if ! make_swap "$BUILD_SWAP_FILE" "$size_mb"; then
+    warn "Không bật được swap tạm - build tiếp, có thể thiếu bộ nhớ."
+    return 0
+  fi
+  BUILD_SWAP_ON=1
+  [[ $((mem_mb + swap_mb + size_mb)) -ge $((MIN_MEM_MB - 512)) ]] ||
+    warn "RAM + swap lúc build chỉ $((mem_mb + swap_mb + size_mb)) MB (ổ đĩa không đủ chỗ): build có thể chậm hoặc thiếu bộ nhớ."
+  return 0
+}
+
+# build_swap_off: after the build (and from cleanup on any exit). swapoff moves what is in the file back to RAM or to
+# the permanent swap: only done when that room exists (else running Postgres / web could be OOM-killed) - the file is
+# then kept active until the next run / reboot (never in fstab). Never fatal.
+build_swap_off() {
+  local used_kb room_kb avail_mb
+  if [[ ! -e "$BUILD_SWAP_FILE" ]]; then
+    BUILD_SWAP_ON=0
+    return 0
+  fi
+  if swap_active "$BUILD_SWAP_FILE"; then
+    used_kb=$(proc_swaps | awk -v f="$BUILD_SWAP_FILE" 'NR > 1 && $1 == f {print $4}')
+    avail_mb=$(meminfo_mb MemAvailable)
+    # free RAM + free space of the OTHER swap areas, minus 256 MB of margin
+    room_kb=$(proc_swaps | awk -v f="$BUILD_SWAP_FILE" -v a="${avail_mb:-0}" \
+      'NR > 1 && $1 != f {free += $3 - $4} END {printf "%d", a * 1024 + free - 262144}')
+    if [[ ${used_kb:-0} -gt ${room_kb:-0} ]]; then
+      warn "Chưa gỡ được swap tạm $BUILD_SWAP_FILE: đang chứa $((${used_kb:-0} / 1024)) MB mà RAM trống không đủ nhận lại. Để nguyên - tự gỡ ở lần cài / cập nhật sau hoặc khi khởi động lại máy."
+      return 0
+    fi
+    if ! run_logged "swapoff build swap" swapoff "$BUILD_SWAP_FILE"; then
+      warn "Chưa gỡ được swap tạm $BUILD_SWAP_FILE (swapoff lỗi). Để nguyên - tự gỡ ở lần sau hoặc khi khởi động lại máy."
+      return 0
+    fi
+  fi
+  rm -f "$BUILD_SWAP_FILE"
+  if [[ $BUILD_SWAP_ON -eq 1 ]]; then ok "Đã gỡ swap tạm của lúc build (trả lại ổ đĩa)"; fi
+  BUILD_SWAP_ON=0
+  return 0
 }
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -1049,9 +1208,12 @@ build_and_start() {
   # updater + the AI services enabled with `sudo ads-agent ai enable` (their image is built from gateway/ only then)
   profiles=$(build_profiles)
   [[ "$profiles" == updater ]] || info "Dịch vụ AI đang bật: ${profiles#updater,} - build thêm image dịch vụ AI (thư mục gateway/)"
+  # swap tạm chỉ trong lúc build (lỗi → cleanup gỡ qua trap EXIT)
+  build_swap_on
   # APP_VERSION only in the build's env: .env keeps the running version until the new images exist
   (export APP_VERSION="$ver" APP_BUILD_VERSION="$ver" COMPOSE_PROFILES="$profiles" && run_logged "docker compose build" dc_build build) ||
     die "Build image thất bại (thường do mạng tải gói chập chờn, thiếu RAM hoặc ổ đĩa). Bản đang chạy không bị ảnh hưởng. Chạy lại đúng lệnh vừa rồi để thử tiếp — phần đã build được giữ trong cache. Nhật ký: $LOG"
+  build_swap_off
   env_set APP_VERSION "$ver"
   ok "Build xong v$ver trong $(((SECONDS - t0) / 60)) phút"
   info "Đang khởi động (database → migrate → web, worker, updater, Caddy)…"
@@ -1109,10 +1271,26 @@ install_commands() {
   ok "Đã cài lệnh: sudo ads-agent-deploy (cập nhật / đổi cách truy cập / đổi token), sudo ads-agent (trạng thái, log, sao lưu…)"
 }
 
-# chỉ image lơ lửng của Ads Agent (nhãn vn.noti.ads-agent=1, docker-compose.build.yml): không bao giờ dọn image /
-# build cache của Ads MCP hay dự án khác trên cùng máy (R19)
+# chỉ image lơ lửng của Ads Agent (nhãn vn.noti.ads-agent=1, docker-compose.build.yml): không bao giờ dọn image của
+# Ads MCP hay dự án khác trên cùng máy (R19). Cache build: prune_build_cache bên dưới.
 prune_images() {
   docker image prune -f --filter label=vn.noti.ads-agent=1 >/dev/null 2>&1 || true
+}
+
+# prune_build_cache: `docker builder prune -f` - chủ dự án quyết 2026-11-12 (ổ đĩa đầy sau mỗi lần build trên VPS). Chỉ
+# gọi SAU một lần cài / cập nhật THÀNH CÔNG (build lỗi giữ cache để chạy lại tiếp được), không chạy định kỳ. Cache
+# BuildKit không giới hạn riêng dự án được: dọn cả cache build của dự án khác trên máy (chỉ làm build sau của họ chậm
+# hơn - không đụng image, container, volume). Lần cập nhật sau build lại từ đầu.
+prune_build_cache() {
+  local out freed
+  if ! out=$(docker builder prune -f 2>>"$LOG"); then
+    warn "Không dọn được cache build (docker builder prune) - bỏ qua."
+    return 0
+  fi
+  log "$out"
+  # "Total reclaimed space: 1.2GB" (docker builder) hoặc "Total: 1.2GB" (buildx prune)
+  freed=$(sed -nE 's/^Total([[:space:]]+reclaimed space)?:[[:space:]]*//Ip' <<<"$out" | tail -n 1)
+  ok "Đã dọn cache build${freed:+ (giải phóng $freed)}"
 }
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -1183,6 +1361,7 @@ cmd_install() {
   step "Hoàn tất"
   install_commands
   prune_images
+  prune_build_cache
   final_screen
 }
 
@@ -1247,12 +1426,15 @@ cmd_update() {
     exit 0
   fi
   step "Build và khởi động lại"
+  # bản cài cũ chỉ có swap cho RAM + swap 4 GB: bù swap thường trực lên 5 GB (swap tạm của lúc build: build_and_start)
+  ensure_swap
   apply_update_env
   build_and_start
   step "Kiểm tra sức khoẻ"
   wait_healthy
   install_commands
   prune_images
+  prune_build_cache
   say ""
   ok "Đã cập nhật lên v$(pkg_version) ($after). Địa chỉ: https://$DOMAIN"
   info "Lần sau: bấm \"Cập nhật ngay\" ở trang Tổng quan khi có bản mới (hoặc chạy lại lệnh này)."
