@@ -104,19 +104,21 @@ tty_ok() { { : </dev/tty; } 2>/dev/null; }
 # Ctrl+D / mất kết nối SSH khi đang hỏi: dừng gọn (chạy lại đúng lệnh cũ là làm tiếp, dữ liệu đã có giữ nguyên)
 tty_closed() { die "Đã dừng (không đọc được bàn phím). Chạy lại đúng lệnh cũ để làm tiếp."; }
 ask() { # ask "Câu hỏi" "mặc định" -> REPLY
+  # -e (readline): Backspace / mũi tên sửa đúng chữ đã gõ - không có -e, terminal gửi Backspace dạng ký tự ^H / ^? thì
+  # màn hình trông đã xoá nhưng chuỗi vẫn chứa ký tự xoá (tên miền "không hợp lệ" dù nhìn đúng)
   local q=$1 def=${2:-} ans=""
   if [[ -n "$def" ]]; then
-    read -r -p "   $q [$def]: " ans </dev/tty || tty_closed
+    read -e -r -p "   $q [$def]: " ans </dev/tty || tty_closed
     REPLY=${ans:-$def}
   else
-    read -r -p "   $q: " ans </dev/tty || tty_closed
+    read -e -r -p "   $q: " ans </dev/tty || tty_closed
     REPLY=$ans
   fi
 }
 ask_yn() { # ask_yn "Câu hỏi" Y|N -> 0 = có
   local q=$1 def=${2:-N} ans="" hint="[y/N]"
   [[ "$def" == "Y" ]] && hint="[Y/n]"
-  read -r -p "   $q $hint: " ans </dev/tty || tty_closed
+  read -e -r -p "   $q $hint: " ans </dev/tty || tty_closed
   ans=${ans:-$def}
   [[ "$ans" =~ ^[YyCc] ]]
 }
@@ -546,18 +548,56 @@ build_swap_off() {
 # ------------------------------------------------------------------------------------------------------------------
 # Hỏi cấu hình
 # ------------------------------------------------------------------------------------------------------------------
-valid_domain() { [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
+# Tên miền: MỌI đuôi đều được (.vn, .com, .asia, .io…, cả đuôi quốc tế dạng punycode xn--…); chỉ cần đúng dạng
+# nhãn.nhãn.đuôi, tổng ≤ 253 ký tự. Giống valid_domain của install-ads-agent.sh và gen-env.mjs.
+valid_domain() {
+  [[ ${#1} -le 253 && "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$ ]]
+}
 valid_email() { [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; }
+
+# clean_domain TEXT: tên miền người dùng muốn nhập, từ chuỗi terminal gửi tới - Backspace / Delete lọt vào dạng ký tự
+# (^H / ^?) được áp dụng (xoá ký tự trước), bỏ ký tự vô hình (rộng 0, BOM, khoảng trắng không ngắt, ký tự điều khiển,
+# khoảng trắng), chữ thường, bỏ http(s)://, đường dẫn, cổng và dấu chấm cuối. Chữ có dấu được giữ nguyên để báo lỗi
+# (thường do bộ gõ tiếng Việt đang bật) - không tự đổi sang punycode.
+clean_domain() {
+  local s=$1 out="" c i z
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    if [[ $c == $'\b' || $c == $'\x7f' ]]; then out=${out%?}; else out+=$c; fi
+  done
+  s=$out
+  for z in $'\xe2\x80\x8b' $'\xe2\x80\x8c' $'\xe2\x80\x8d' $'\xe2\x81\xa0' $'\xef\xbb\xbf' $'\xc2\xa0'; do
+    s=${s//"$z"/}
+  done
+  s=${s//$'\xe3\x80\x82'/.} # dấu chấm kiểu Nhật / Trung "。"
+  s=$(printf '%s' "$s" | tr -d '[:cntrl:][:space:]' | tr '[:upper:]' '[:lower:]')
+  s=${s#http://}
+  s=${s#https://}
+  s=${s%%/*}
+  s=${s%%:*}
+  s=${s%.}
+  printf '%s' "$s"
+}
+
+# domain_error TEXT: câu báo lỗi cho một tên miền không hợp lệ - in nguyên văn chuỗi đã nhận (thấy được ký tự lạ)
+domain_error() {
+  local shown
+  shown=$(printf '%q' "$1")
+  if [[ -z "$1" ]]; then
+    printf 'Chưa nhập tên miền.'
+  elif LC_ALL=C grep -q '[^ -~]' <<<"$1"; then
+    printf 'Tên miền có chữ có dấu / ký tự lạ (script nhận được: %s). Tắt bộ gõ tiếng Việt (Unikey, EVKey…) rồi gõ lại. Tên miền tiếng Việt có dấu thì nhập dạng punycode (xn--…).' "$shown"
+  else
+    printf 'Tên miền không hợp lệ (script nhận được: %s). Cần dạng tên.đuôi, đuôi nào cũng được - vd agent.congty.vn, ads.congty.com, agent.noti.asia.' "$shown"
+  fi
+}
 
 ask_domain_email() {
   while :; do
-    ask "Tên miền cho Ads Agent (vd agent.congty.vn)" "$(env_get APP_DOMAIN)"
-    DOMAIN=$(printf '%s' "$REPLY" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-    DOMAIN=${DOMAIN#https://}
-    DOMAIN=${DOMAIN#http://}
-    DOMAIN=${DOMAIN%%/*}
+    ask "Tên miền cho Ads Agent (vd agent.congty.vn, ads.congty.com)" "$(env_get APP_DOMAIN)"
+    DOMAIN=$(clean_domain "$REPLY")
     valid_domain "$DOMAIN" && break
-    warn "Tên miền không hợp lệ. Ví dụ đúng: agent.congty.vn"
+    warn "$(domain_error "$DOMAIN")"
   done
   while :; do
     ask "Email quản trị (nhận thông báo chứng chỉ SSL)" "$(env_get ACME_EMAIL)"
